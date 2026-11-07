@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+#
+# git vibecheck: a per-branch checklist of the files a human has approved.
+#
+# Approvals live in refs/review/<branch>: a commit whose parent is the branch's
+# merge base and whose tree is that base with every approved file overlaid at
+# the content it had when approved. A file stays approved only while the
+# working tree still matches that overlay, so any later edit sends it back to
+# pending. Commits, the index and the stash are never touched.
+#
+# Must stay compatible with bash 3.2 (the macOS /bin/bash).
+
+set -euo pipefail
+
+NOT_STARTED=3
+
+usage() {
+  cat <<'EOF'
+usage: git vibecheck [--base <branch>]     start reviewing this branch, or show its checklist
+   or: git vibecheck pending               list the files still waiting for approval
+   or: git vibecheck approve <path>...     approve files at their current content
+   or: git vibecheck unapprove <path>...   send approved files back to pending
+
+  [x] approved   [ ] never reviewed   [~] changed since approved
+
+`git vibecheck pending` exits 0 only when nothing is left to review.
+EOF
+}
+
+die() {
+  printf 'git vibecheck: %s\n' "$1" >&2
+  exit "${2:-2}"
+}
+
+g() {
+  git -c core.quotePath=false "$@"
+}
+
+default_base() {
+  if git symbolic-ref -q --short refs/remotes/origin/HEAD; then
+    return
+  elif git rev-parse -q --verify refs/heads/main >/dev/null; then
+    echo main
+  else
+    echo master
+  fi
+}
+
+base_name() {
+  git config --get "$base_key" || default_base
+}
+
+merge_base() {
+  local name
+  name=$(base_name)
+  git merge-base "$name" HEAD 2>/dev/null || die "no common ancestor between $name and HEAD"
+}
+
+require_started() {
+  [ "$state" != "$zero" ] || die "this branch is not under review; run \`git vibecheck\` to start" "$NOT_STARTED"
+}
+
+# Point the review ref at <tree>, recording <parent> (the merge base the tree
+# was built on) so later runs can tell when a rebase or merge moved it.
+write_ref() {
+  local tree=$1 parent=$2 commit
+  commit=$(
+    GIT_AUTHOR_NAME=git-vibecheck GIT_AUTHOR_EMAIL=git-vibecheck@localhost \
+      GIT_COMMITTER_NAME=git-vibecheck GIT_COMMITTER_EMAIL=git-vibecheck@localhost \
+      git commit-tree "$tree" -p "$parent" -m "git vibecheck: $branch"
+  )
+  git update-ref -m "git vibecheck" "$ref" "$commit" "$state" 2>/dev/null ||
+    die "the review changed while this command ran; try again"
+  state=$commit
+}
+
+# Print `git update-index --index-info` lines that turn <from> into <to> for
+# the given pathspecs (which, like any git pathspec, are relative to the cwd).
+index_info() {
+  local from=$1 to=$2
+  shift 2
+  g diff-tree -r --no-renames "$from" "$to" -- "$@" |
+    awk -F '\t' -v zero="$zero" '{
+      split($1, f, " ")
+      if (f[5] == "D") print "0 " zero "\t" $2
+      else print f[2] " " f[4] "\t" $2
+    }'
+}
+
+# Copy the entries matching the pathspecs from <source> into the review tree.
+overlay() {
+  local source=$1 index="$tmp/overlay.index"
+  shift
+  GIT_INDEX_FILE=$index git read-tree "$ref"
+  index_info "$ref" "$source" "$@" | GIT_INDEX_FILE=$index git -C "$top" update-index --index-info
+  write_ref "$(GIT_INDEX_FILE=$index git write-tree)" "$base"
+}
+
+# Set $base to the current merge base, first rebuilding the review tree on top
+# of it if it moved, so never-reviewed files keep comparing against the base
+# the branch actually has now while approvals carry over.
+sync_base() {
+  local old_base index="$tmp/sync.index"
+  base=$(merge_base)
+  old_base=$(git rev-parse "$ref^1")
+  if [ "$old_base" != "$base" ]; then
+    GIT_INDEX_FILE=$index git read-tree "$base"
+    index_info "$old_base" "$ref" | GIT_INDEX_FILE=$index git -C "$top" update-index --index-info
+    write_ref "$(GIT_INDEX_FILE=$index git write-tree)" "$base"
+  fi
+}
+
+# Write a tree of the whole working tree, untracked files included, using a
+# throwaway copy of the index so the real one is never modified.
+worktree_tree() {
+  local index="$tmp/worktree.index"
+  cp "$git_dir/index" "$index" 2>/dev/null || :
+  GIT_INDEX_FILE=$index git -c advice.addEmbeddedRepo=false -c core.safecrlf=false add -A
+  GIT_INDEX_FILE=$index git write-tree
+}
+
+# Print "<marker> <path>" for every file that differs from the base.
+checklist() {
+  local worktree=$1
+  g diff-tree -r --name-only --no-renames "$ref" "$worktree" >"$tmp/pending"
+  g diff-tree -r --name-only --no-renames "$base" "$ref" >"$tmp/approved"
+  g diff-tree -r --name-only --no-renames "$base" "$worktree" |
+    awk -v pending="$tmp/pending" -v approved="$tmp/approved" '
+      BEGIN {
+        while ((getline line < pending) > 0) p[line] = 1
+        while ((getline line < approved) > 0) a[line] = 1
+      }
+      { print (!($0 in p) ? "[x]" : ($0 in a) ? "[~]" : "[ ]") " " $0 }
+    '
+}
+
+cmd_start() {
+  local requested=$1 list="$tmp/list" total approved
+  if [ -n "$requested" ]; then
+    git rev-parse -q --verify "$requested^{commit}" >/dev/null || die "unknown base: $requested"
+    git config "$base_key" "$requested"
+  elif ! git config --get "$base_key" >/dev/null; then
+    git config "$base_key" "$(default_base)"
+  fi
+
+  if [ "$state" = "$zero" ]; then
+    base=$(merge_base)
+    write_ref "$(git rev-parse "$base^{tree}")" "$base"
+  else
+    sync_base
+  fi
+
+  checklist "$(worktree_tree)" >"$list"
+  total=$(grep -c '' "$list" || :)
+  approved=$(grep -c '^\[x\]' "$list" || :)
+  printf '%s vs %s: %s/%s approved\n' "$branch" "$(base_name)" "$approved" "$total"
+  if [ -s "$list" ]; then
+    echo
+    cat "$list"
+  fi
+}
+
+cmd_pending() {
+  [ $# -eq 0 ] || die "pending takes no arguments"
+  require_started
+  sync_base
+  checklist "$(worktree_tree)" | grep -v '^\[x\]' >"$tmp/list" || :
+  if [ -s "$tmp/list" ]; then
+    cat "$tmp/list"
+    exit 1
+  fi
+  if [ -t 1 ]; then
+    echo "nothing left to review"
+  fi
+}
+
+cmd_approve() {
+  local worktree
+  [ $# -gt 0 ] || die "approve needs at least one path (use . for everything)"
+  require_started
+  sync_base
+  worktree=$(worktree_tree)
+  g diff-tree -r --name-only --no-renames "$ref" "$worktree" -- "$@" >"$tmp/matched"
+  if [ ! -s "$tmp/matched" ]; then
+    if [ -n "$(g diff-tree -r --name-only --no-renames "$base" "$worktree" -- "$@")" ]; then
+      echo "already approved: $*"
+      return
+    fi
+    die "no file under review matches: $*"
+  fi
+  overlay "$worktree" "$@"
+  sed 's/^/approved /' "$tmp/matched"
+}
+
+cmd_unapprove() {
+  [ $# -gt 0 ] || die "unapprove needs at least one path (use . for everything)"
+  require_started
+  sync_base
+  g diff-tree -r --name-only --no-renames "$base" "$ref" -- "$@" >"$tmp/matched"
+  if [ ! -s "$tmp/matched" ]; then
+    echo "not approved: $*"
+    return
+  fi
+  overlay "$base" "$@"
+  sed 's/^/unapproved /' "$tmp/matched"
+}
+
+# Plumbing for editor and agent integrations: the part of each file that is
+# still unreviewed, as a unified diff against what was approved (or against the
+# base for files never approved).
+cmd_diff() {
+  local index="$tmp/diff.index"
+  require_started
+  sync_base
+  cp "$git_dir/index" "$index" 2>/dev/null || :
+  GIT_INDEX_FILE=$index git add -A -- "$@" 2>/dev/null || :
+  GIT_INDEX_FILE=$index g diff --cached --no-color --no-ext-diff "$ref" -- "$@"
+}
+
+case "${1:-}" in
+-h | --help | help)
+  usage
+  exit 0
+  ;;
+esac
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git work tree"
+top=$(git rev-parse --show-toplevel)
+git_dir=$(git rev-parse --absolute-git-dir)
+branch=$(git symbolic-ref -q --short HEAD) || die "HEAD is detached; check out a branch first"
+ref="refs/review/$branch"
+base_key="branch.$branch.reviewBase"
+zero=$(git hash-object --stdin </dev/null | tr '0-9a-f' '0')
+state=$(git rev-parse -q --verify "$ref" || echo "$zero")
+base=""
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/git-vibecheck.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+case "${1:-}" in
+"") cmd_start "" ;;
+--base)
+  [ $# -eq 2 ] || die "usage: git vibecheck --base <branch>"
+  cmd_start "$2"
+  ;;
+--base=*)
+  [ $# -eq 1 ] || die "usage: git vibecheck --base <branch>"
+  cmd_start "${1#--base=}"
+  ;;
+pending)
+  shift
+  cmd_pending "$@"
+  ;;
+approve)
+  shift
+  cmd_approve "$@"
+  ;;
+unapprove)
+  shift
+  cmd_unapprove "$@"
+  ;;
+_diff)
+  shift
+  cmd_diff "$@"
+  ;;
+*)
+  usage >&2
+  exit 2
+  ;;
+esac
