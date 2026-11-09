@@ -63,7 +63,7 @@ Each branch has its own review. A new branch starts from zero.
 
 | Key           | Action                                                                       |
 | ------------- | ---------------------------------------------------------------------------- |
-| `<leader>gvr` | Checklist picker. Preview shows what is left to review; `a`/`u` (normal mode) approve or unapprove |
+| `<leader>gvr` | Checklist picker. Preview shows what is left to review; `a`/`u` (normal mode) approve or unapprove the file under the cursor, or every file selected with `Tab` |
 | `<leader>gva` | Approve the current file (unsaved changes are written first)                 |
 | `<leader>gvu` | Unapprove the current file                                                   |
 | `<leader>gvn` | Open the next pending file                                                   |

@@ -109,13 +109,15 @@ local function write_if_modified(path)
   end
 end
 
-local function set_mark(root, action, file)
+local function set_mark(root, action, files)
   local code, out, err
   if action == "approve" then
-    write_if_modified(vim.fs.joinpath(root, file))
-    code, out, err = run_started(root, { "approve", file })
+    for _, file in ipairs(files) do
+      write_if_modified(vim.fs.joinpath(root, file))
+    end
+    code, out, err = run_started(root, vim.list_extend({ "approve" }, files))
   else
-    code, out, err = run(root, { action, file })
+    code, out, err = run(root, vim.list_extend({ action }, files))
   end
   if code == nil then
     return
@@ -138,7 +140,7 @@ local function with_current_file(action)
   if not file then
     return notify("This buffer is not a file in the repository", vim.log.levels.WARN)
   end
-  set_mark(root, action, file)
+  set_mark(root, action, { file })
 end
 
 function M.approve()
@@ -215,9 +217,13 @@ function M.tracker()
   end
 
   local function act(action)
-    return function(picker, item)
-      if item then
-        set_mark(root, action, item.file)
+    return function(picker)
+      local files = vim.tbl_map(function(item)
+        return item.file
+      end, picker:selected({ fallback = true }))
+      if #files > 0 then
+        set_mark(root, action, files)
+        picker.list:set_selected()
         picker:refresh()
       end
     end
