@@ -211,13 +211,12 @@ cmd_unapprove() {
 # The part of each file that is still unreviewed, as a unified diff against
 # what was approved (or against the base for files never approved).
 cmd_pending_diff() {
-  local index="$tmp/diff.index"
+  local worktree
   require_started
   sync_base
-  cp "$git_dir/index" "$index" 2>/dev/null || :
-  GIT_INDEX_FILE=$index git add -A -- "$@" 2>/dev/null || :
-  GIT_INDEX_FILE=$index g diff --cached --no-color --no-ext-diff --no-renames --no-relative \
-    --src-prefix=a/ --dst-prefix=b/ "$ref" -- "$@"
+  worktree=$(worktree_tree)
+  g diff --no-color --no-ext-diff --no-renames --no-relative \
+    --src-prefix=a/ --dst-prefix=b/ "$ref" "$worktree" -- "$@"
 }
 
 case "${1:-}" in
