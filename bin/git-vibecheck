@@ -216,7 +216,7 @@ cmd_pending_diff() {
   sync_base
   cp "$git_dir/index" "$index" 2>/dev/null || :
   GIT_INDEX_FILE=$index git add -A -- "$@" 2>/dev/null || :
-  GIT_INDEX_FILE=$index g diff --cached --no-color --no-ext-diff "$ref" -- "$@"
+  GIT_INDEX_FILE=$index g diff --cached --no-color --no-ext-diff --no-renames "$ref" -- "$@"
 }
 
 case "${1:-}" in

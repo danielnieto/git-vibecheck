@@ -133,6 +133,15 @@ expect_code "deletion approved" 0 review pending
 git checkout -q main -- c
 expect_eq "restored file leaves the checklist" "feat vs main: 0/0 approved" "$(review)"
 
+scenario "a rename is a deletion plus a new file, also in pending-diff"
+git mv a z
+git commit -qm "rename a"
+review >/dev/null
+expect_eq "pending" "[ ] a
+[ ] z" "$(pending)"
+expect_eq "pending-diff" "deleted file mode 100644
+new file mode 100644" "$(review pending-diff | grep -E '^(rename|deleted|new) ')"
+
 scenario "unapprove"
 echo 4 >>a
 echo 4 >>b
