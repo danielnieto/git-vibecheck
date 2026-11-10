@@ -114,10 +114,13 @@ sync_base() {
 }
 
 # Write a tree of the whole working tree, untracked files included, using a
-# throwaway copy of the index so the real one is never modified.
+# throwaway copy of the index so the real one is never modified. The copy keeps
+# the index's mtime: git compares contents for files modified in the same
+# second as the index was written, and a newer copy would trust their stale
+# stat data instead.
 worktree_tree() {
   local index="$tmp/worktree.index"
-  cp "$git_dir/index" "$index" 2>/dev/null || :
+  cp -p "$git_dir/index" "$index" 2>/dev/null || :
   GIT_INDEX_FILE=$index git -c advice.addEmbeddedRepo=false -c core.safecrlf=false add -A
   GIT_INDEX_FILE=$index git write-tree
 }

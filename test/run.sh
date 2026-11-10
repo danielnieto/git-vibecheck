@@ -107,6 +107,21 @@ expect_eq "delta" "+5" "$(review pending-diff a | grep '^[+-][^+-]')"
 review approve a >/dev/null
 expect_code "approved again" 0 review pending
 
+scenario "a same-size edit that only a content check can see"
+# The file, its index entry and the index share an mtime, so git must compare
+# contents instead of trusting the timestamp. A copy of the index has to keep
+# that mtime, or the edit goes unnoticed and the stale approval stands.
+git config core.trustctime false
+printf '1\n2\nX\n' >a
+touch -t 202001010000 a
+git add a
+touch -t 202001010000 .git/index
+review >/dev/null
+review approve a >/dev/null
+printf '1\n2\nY\n' >a
+touch -t 202001010000 a
+expect_eq "pending" "[~] a" "$(pending)"
+
 scenario "never-reviewed diff is against the base"
 echo 4 >>a
 echo 4 >>b
