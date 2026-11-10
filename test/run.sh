@@ -142,6 +142,16 @@ expect_eq "pending" "[ ] a
 expect_eq "pending-diff" "deleted file mode 100644
 new file mode 100644" "$(review pending-diff | grep -E '^(rename|deleted|new) ')"
 
+scenario "pending-diff output does not depend on diff config"
+mkdir sub
+echo 4 >>a
+review >/dev/null
+git config diff.noprefix true
+git config diff.relative true
+git config diff.mnemonicPrefix true
+expect_eq "root-relative paths with a/ and b/, even from a subdirectory" "--- a/a
++++ b/a" "$(cd sub && review pending-diff | grep '^[-+][-+][-+] ')"
+
 scenario "unapprove"
 echo 4 >>a
 echo 4 >>b
