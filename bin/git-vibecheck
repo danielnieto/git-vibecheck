@@ -24,6 +24,9 @@ usage: git vibecheck [--base <branch>]     start reviewing this branch, or show 
   [x] approved   [ ] never reviewed   [~] changed since approved
 
 `git vibecheck pending` exits 0 only when nothing is left to review.
+
+Plumbing, for editor and agent integrations:
+   git vibecheck pending-diff [<path>...]  what is left to review, as a unified diff
 EOF
 }
 
@@ -205,10 +208,9 @@ cmd_unapprove() {
   sed 's/^/unapproved /' "$tmp/matched"
 }
 
-# Plumbing for editor and agent integrations: the part of each file that is
-# still unreviewed, as a unified diff against what was approved (or against the
-# base for files never approved).
-cmd_diff() {
+# The part of each file that is still unreviewed, as a unified diff against
+# what was approved (or against the base for files never approved).
+cmd_pending_diff() {
   local index="$tmp/diff.index"
   require_started
   sync_base
@@ -258,9 +260,9 @@ unapprove)
   shift
   cmd_unapprove "$@"
   ;;
-_diff)
+pending-diff)
   shift
-  cmd_diff "$@"
+  cmd_pending_diff "$@"
   ;;
 *)
   usage >&2

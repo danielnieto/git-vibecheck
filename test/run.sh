@@ -103,14 +103,17 @@ review approve a >/dev/null
 echo 5 >>a
 git commit -qam "touch a again"
 expect_eq "pending" "[~] a" "$(pending)"
-expect_eq "delta" "+5" "$(review _diff a | grep '^[+-][^+-]')"
+expect_eq "delta" "+5" "$(review pending-diff a | grep '^[+-][^+-]')"
 review approve a >/dev/null
 expect_code "approved again" 0 review pending
 
 scenario "never-reviewed diff is against the base"
 echo 4 >>a
+echo 4 >>b
 review >/dev/null
-expect_eq "diff" "+4" "$(review _diff a | grep '^[+-][^+-]')"
+expect_eq "diff" "+4" "$(review pending-diff a | grep '^[+-][^+-]')"
+expect_eq "no paths means every pending file" "a
+b" "$(review pending-diff | sed -n 's|^+++ b/||p')"
 
 scenario "untracked files"
 echo new >d
@@ -119,7 +122,7 @@ review approve d >/dev/null
 expect_code "approved untracked" 0 review pending
 echo more >>d
 expect_eq "pending" "[~] d" "$(pending)"
-expect_eq "delta" "+more" "$(review _diff d | grep '^[+-][^+-]')"
+expect_eq "delta" "+more" "$(review pending-diff d | grep '^[+-][^+-]')"
 
 scenario "deletions"
 git rm -q c
@@ -179,7 +182,7 @@ expect_eq "checklist after rebase" "feat vs main: 1/2 approved
 
 [x] a
 [ ] b" "$(review)"
-expect_eq "never-reviewed diff uses the new base" "+4" "$(review _diff b | grep '^[+-][^+-]')"
+expect_eq "never-reviewed diff uses the new base" "+4" "$(review pending-diff b | grep '^[+-][^+-]')"
 
 scenario "--base for stacked branches"
 echo 4 >>a

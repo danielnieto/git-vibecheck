@@ -13,7 +13,7 @@ M.config = {
 M.impact_prompt = table.concat({
   "I'm reviewing this branch file by file with `git vibecheck`. Run `git vibecheck` to see the checklist:",
   "[x] = approved by me, [ ] = never reviewed, [~] = changed since I approved it.",
-  "For a pending file, `git vibecheck _diff <path>` shows exactly the part I have not reviewed yet.",
+  "For a pending file, `git vibecheck pending-diff <path>` shows exactly the part I have not reviewed yet.",
   "",
   "Tell me which [x] files could be affected by the pending changes: changed signatures, contracts,",
   "return values, side effects, or assumptions the approved code relies on. For each one, name the",
@@ -254,7 +254,7 @@ function M.tracker()
         return Snacks.picker.preview.file(ctx)
       end
       if ctx.item.diff == nil then
-        local _, out = run(root, { "_diff", ctx.item.file })
+        local _, out = run(root, { "pending-diff", ctx.item.file })
         ctx.item.diff = out
       end
       return Snacks.picker.preview.diff(ctx)

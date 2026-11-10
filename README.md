@@ -54,10 +54,20 @@ git vibecheck unapprove <path>...   send approved files back to pending
   everything, but only because you asked for it.
 - `git vibecheck pending` exits 0 only when nothing is left, so agents and scripts
   can check whether you are done.
-- `git vibecheck _diff <path>...` is plumbing for integrations: the part of each
-  file you have not reviewed yet, as a unified diff.
 
 Each branch has its own review. A new branch starts from zero.
+
+### Plumbing
+
+For editor and agent integrations:
+
+```
+git vibecheck pending-diff [<path>...]   what is left to review, as a unified diff
+```
+
+`pending-diff` shows, for each file, the part you have not reviewed yet: the
+diff from what you approved (or from the base, for files you never approved)
+to your working tree.
 
 ## Neovim
 
