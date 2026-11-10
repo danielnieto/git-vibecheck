@@ -4,9 +4,10 @@ A per-branch checklist of the files **a human** has reviewed.
 
 The workflow it supports: let agents vibe-code a branch, then go file by file
 cleaning it up until it is worth a PR. Mark each file as approved when you are
-happy with it. If anything changes that file afterwards (you, an agent, a
-rebase), it drops back to pending and you only re-review the new part. You are
-done when nothing is pending, whether that took 1 commit or 100.
+happy with it, whole or hunk by hunk. If anything changes that file afterwards
+(you, an agent, a rebase), it drops back to pending and you only re-review the
+new part. You are done when nothing is pending, whether that took 1 commit or
+100.
 
 ```
 $ git vibecheck
@@ -18,7 +19,8 @@ nieto/my-branch vs origin/main: 9/12 approved
 ...
 ```
 
-`[x]` approved, `[ ]` never reviewed, `[~]` changed since you approved it.
+`[x]` approved, `[ ]` never reviewed, `[~]` partly approved, or changed since
+you approved it.
 
 ## Install
 
@@ -63,11 +65,23 @@ For editor and agent integrations:
 
 ```
 git vibecheck pending-diff [<path>...]   what is left to review, as a unified diff
+git vibecheck approve-patch < <patch>    approve the changes in a patch of what is left
 ```
 
 `pending-diff` shows, for each file, the part you have not reviewed yet: the
 diff from what you approved (or from the base, for files you never approved)
 to your working tree.
+
+`approve-patch` approves part of that: any subset of `pending-diff`'s hunks, or
+a patch an editor builds from the hunks it shows, with or without context
+lines. Each file's `index` line must name the approved version the patch was
+made from, so a patch made before the review changed is refused instead of
+applied to content it was not made for. For example, to approve the first
+hunk of a file:
+
+```sh
+git vibecheck pending-diff app/views.py | awk '/^@@/ { h++ } h <= 1' | git vibecheck approve-patch
+```
 
 ## Neovim
 
@@ -76,13 +90,21 @@ to your working tree.
 | `<leader>gvr` | Checklist picker. Preview shows what is left to review; `a`/`u` (normal mode) approve or unapprove the file under the cursor, or every file selected with `Tab` |
 | `<leader>gva` | Approve the current file (unsaved changes are written first)                 |
 | `<leader>gvu` | Unapprove the current file                                                   |
+| `<leader>gvh` | Approve the hunk under the cursor; in visual mode, every hunk the selection touches (needs gitsigns.nvim) |
 | `<leader>gvn` | Open the next pending file                                                   |
 | `<leader>gvd` | Toggle the gitsigns gutter between its normal base and "only what is left to review" |
 | `<leader>gvi` | Ask the agent which approved files the pending changes could affect (needs sidekick.nvim) |
 
-The picker needs [snacks.nvim](https://github.com/folke/snacks.nvim) and the
-gutter toggle needs [gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim).
-Any command run on a branch that is not under review offers to start it.
+The picker needs [snacks.nvim](https://github.com/folke/snacks.nvim), and the
+gutter toggle and hunk approval need
+[gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim). Everything else
+works without them. Any command run on a branch that is not under review offers
+to start it.
+
+`<leader>gvh` turns on the review gutter and approves exactly the hunks
+gitsigns shows there, however your `diffopt` cuts them (with `linematch`, one
+changed block can be several hunks). Before approving, it checks that those
+hunks are against what is approved right now, and refuses otherwise.
 
 Options:
 
@@ -94,13 +116,13 @@ opts = {
 ```
 
 The functions are public if you prefer your own mappings:
-`require("git-vibecheck").tracker / approve / unapprove / next_pending / toggle_gutter / impact`.
+`require("git-vibecheck").tracker / approve / unapprove / approve_hunk / next_pending / toggle_gutter / impact`.
 
 ## Agents
 
 Editing a file un-approves it, so an agent can never make unreviewed code look
-reviewed by touching files. The one thing it could do is run
-`git vibecheck approve` itself, so do not tell agents to.
+reviewed by touching files. The one thing it could do is approve on your
+behalf (`git vibecheck approve` or `approve-patch`), so do not tell agents to.
 
 The impact check (`<leader>gvi`) catches what content tracking cannot: an
 approved file that did not change but depends on something that did. To also
@@ -129,7 +151,8 @@ paste it into any agent.
 Approvals live in a local ref, `refs/review/<branch>`, that is never pushed. It
 points to a commit whose parent is the branch's merge base and whose tree is
 that base with every approved file overlaid at the content it had when
-approved. A file is approved while your working tree matches that overlay.
+approved, or, for a file approved hunk by hunk, the base plus those hunks. A
+file is approved while your working tree matches that overlay.
 
 Your index, stash and commits are never touched: the working tree is
 snapshotted through a throwaway copy of the index. When a rebase or merge moves
@@ -139,7 +162,11 @@ over.
 ## Known limitations
 
 - Renaming a branch leaves its approvals under the old name.
-- Approval is per file, not per hunk.
+- Hunks are approved from Neovim (with gitsigns) or through `approve-patch`;
+  there is no interactive hunk mode in the terminal. Unapproving is per file.
+- `<leader>gvh` refuses a hunk that adds or removes lines at the end of a file
+  without a final newline, and a file whose final newline changed; approve
+  those files whole.
 - A rename shows up as a deletion plus a new file; approve both.
 
 ## Tests

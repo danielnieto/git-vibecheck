@@ -4,9 +4,10 @@
 #
 # Approvals live in refs/review/<branch>: a commit whose parent is the branch's
 # merge base and whose tree is that base with every approved file overlaid at
-# the content it had when approved. A file stays approved only while the
-# working tree still matches that overlay, so any later edit sends it back to
-# pending. Commits, the index and the stash are never touched.
+# the content it had when approved (or, for a file approved hunk by hunk, the
+# base plus the approved hunks). A file is approved only while the working tree
+# matches that overlay, so any later edit sends it back to pending. Commits,
+# the index and the stash are never touched.
 #
 # Must stay compatible with bash 3.2 (the macOS /bin/bash).
 
@@ -21,12 +22,13 @@ usage: git vibecheck [--base <branch>]     start reviewing this branch, or show 
    or: git vibecheck approve <path>...     approve files at their current content
    or: git vibecheck unapprove <path>...   send approved files back to pending
 
-  [x] approved   [ ] never reviewed   [~] changed since approved
+  [x] approved   [ ] never reviewed   [~] partly approved, or changed since approved
 
 `git vibecheck pending` exits 0 only when nothing is left to review.
 
 Plumbing, for editor and agent integrations:
    git vibecheck pending-diff [<path>...]  what is left to review, as a unified diff
+   git vibecheck approve-patch < <patch>   approve the changes in a patch of what is left
 EOF
 }
 
@@ -222,6 +224,85 @@ cmd_pending_diff() {
     --src-prefix=a/ --dst-prefix=b/ "$ref" "$worktree" -- "$@"
 }
 
+# Print "<old blob id>\t<path>" for each file in a git-format patch, taking the
+# id from the file's index line, or "none" without one (`read` would silently
+# drop an empty first field). Fails on renames, copies and quoted paths, which
+# approve-patch does not support.
+patch_files() {
+  awk '
+    function flush() {
+      if (path != "") print (old == "" ? "none" : old) "\t" path
+      old = ""; path = ""; minus = ""
+    }
+    function strip(name, prefix) {
+      sub(/\t$/, "", name)
+      if (name == "/dev/null") return name
+      if (substr(name, 1, 2) != prefix) exit 1
+      return substr(name, 3)
+    }
+    /^diff --git / { flush(); body = 0; next }
+    body && /^[-+ \\]/ { next }
+    /^@@ / { body = 1; next }
+    /^(rename|copy) (from|to) / { exit 1 }
+    /^index / { split($2, ids, /\.\./); old = ids[1]; next }
+    /^--- / { minus = strip(substr($0, 5), "a/"); next }
+    /^\+\+\+ / {
+      path = strip(substr($0, 5), "b/")
+      if (path == "/dev/null") path = minus
+      next
+    }
+    END { flush() }
+  '
+}
+
+# Approve the changes in a patch read from stdin. The patch goes from what is
+# approved to the working tree, like any part of `pending-diff`. Each file's
+# index line must name the approved version the patch was made from, so a
+# patch made before the review changed is refused instead of landing on
+# content it was not made for.
+cmd_approve_patch() {
+  local patch="$tmp/patch" index="$tmp/patch.index" worktree old path approved current
+  [ $# -eq 0 ] || die "approve-patch takes no arguments; pipe the patch to it"
+  require_started
+  sync_base
+  cat >"$patch"
+  [ -s "$patch" ] || die "approve-patch needs a patch on stdin"
+  patch_files <"$patch" >"$tmp/files" ||
+    die "approve-patch takes git-format patches with a/ and b/ paths, without renames, copies or quoted paths"
+  [ -s "$tmp/files" ] || die "the patch changes no file"
+
+  worktree=$(worktree_tree)
+  g diff-tree -r --name-only --no-renames "$base" "$worktree" >"$tmp/reviewed"
+  while IFS=$'\t' read -r old path; do
+    grep -qxF -- "$path" "$tmp/reviewed" || die "not under review: $path"
+    [ "$old" != none ] || die "the patch has no index line for $path; make it with \`git vibecheck pending-diff\`"
+    approved=$(git rev-parse -q --verify "$state:$path" || echo "$zero")
+    case $approved in
+    "$old"*) ;;
+    *) die "$path changed in the review since the patch was made; make the patch again" ;;
+    esac
+  done <"$tmp/files"
+
+  GIT_INDEX_FILE=$index git read-tree "$state"
+  # Paths in the patch are relative to the top level, and git apply run from a
+  # subdirectory silently skips everything outside it.
+  GIT_INDEX_FILE=$index git -C "$top" apply --cached --unidiff-zero --whitespace=nowarn "$patch" 2>"$tmp/apply.err" || {
+    cat "$tmp/apply.err" >&2
+    die "the patch does not apply to what you approved"
+  }
+  write_ref "$(GIT_INDEX_FILE=$index git write-tree)" "$base"
+
+  while IFS=$'\t' read -r old path; do
+    approved=$(git rev-parse -q --verify "$state:$path" || echo "$zero")
+    current=$(git rev-parse -q --verify "$worktree:$path" || echo "$zero")
+    if [ "$approved" = "$current" ]; then
+      echo "approved $path"
+    else
+      echo "approved part of $path"
+    fi
+  done <"$tmp/files"
+}
+
 case "${1:-}" in
 -h | --help | help)
   usage
@@ -266,6 +347,10 @@ unapprove)
 pending-diff)
   shift
   cmd_pending_diff "$@"
+  ;;
+approve-patch)
+  shift
+  cmd_approve_patch "$@"
   ;;
 *)
   usage >&2

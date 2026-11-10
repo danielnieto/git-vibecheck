@@ -61,10 +61,48 @@ pending() {
   review pending || :
 }
 
+approve_patch() {
+  review approve-patch <"$1"
+}
+
+expect_error() {
+  local label=$1 text=$2 code=0
+  shift 2
+  "$@" >/dev/null 2>"$ROOT/stderr" || code=$?
+  expect_eq "$label (exit code)" 2 "$code"
+  grep -qF -- "$text" "$ROOT/stderr" || fail "$label (message: $(cat "$ROOT/stderr"))"
+}
+
+# Keep a one-file patch's headers and only its <n>th hunk.
+nth_hunk() {
+  awk -v n="$1" '/^@@/ { h++ } h == 0 || h == n'
+}
+
+# Add a 20-line file f to the base, so a change can have hunks far apart.
+long_file() {
+  git switch -q main
+  seq 1 20 >f
+  git add f
+  git commit -qm "add f"
+  git switch -q feat
+  git merge -q --ff-only main
+}
+
+change_f_twice() {
+  {
+    echo 1
+    echo TWO
+    seq 3 17
+    echo EIGHTEEN
+    seq 19 20
+  } >f
+}
+
 scenario "not started"
 echo 4 >>a
 expect_code "pending before start" 3 review pending
 expect_code "approve before start" 3 review approve a
+expect_code "approve-patch before start" 3 approve_patch /dev/null
 
 scenario "start lists committed, uncommitted and untracked changes"
 echo 4 >>a
@@ -173,6 +211,77 @@ git config diff.relative true
 git config diff.mnemonicPrefix true
 expect_eq "root-relative paths with a/ and b/, even from a subdirectory" "--- a/a
 +++ b/a" "$(cd sub && review pending-diff | grep '^[-+][-+][-+] ')"
+
+scenario "approve-patch approves one hunk at a time"
+long_file
+change_f_twice
+git add f
+status_before=$(git status --porcelain)
+head_before=$(git rev-parse HEAD)
+review >/dev/null
+expect_eq "approve the second hunk" "approved part of f" "$(review pending-diff f | nth_hunk 2 | review approve-patch)"
+expect_eq "pending" "[~] f" "$(pending)"
+expect_eq "only the first hunk is left" "-2
++TWO" "$(review pending-diff f | grep '^[+-][^+-]')"
+expect_eq "approve the rest" "approved f" "$(review pending-diff f | review approve-patch)"
+expect_code "nothing left" 0 review pending
+expect_eq "index untouched" "$status_before" "$(git status --porcelain)"
+expect_eq "HEAD untouched" "$head_before" "$(git rev-parse HEAD)"
+
+scenario "approve-patch refuses a patch made before the review changed"
+long_file
+change_f_twice
+review >/dev/null
+review pending-diff f | nth_hunk 1 >"$ROOT/first.patch"
+review pending-diff f | nth_hunk 2 >"$ROOT/second.patch"
+approve_patch "$ROOT/first.patch" >/dev/null
+expect_error "stale patch" "f changed in the review since the patch was made" approve_patch "$ROOT/second.patch"
+expect_eq "nothing else was approved" "-18
++EIGHTEEN" "$(review pending-diff f | grep '^[+-][^+-]')"
+
+scenario "approve-patch takes zero-context patches, as editors make them"
+long_file
+change_f_twice
+review >/dev/null
+expect_eq "approve" "approved part of f" "$(git diff -U0 f | nth_hunk 2 | review approve-patch)"
+expect_eq "only the first hunk is left" "-2
++TWO" "$(review pending-diff f | grep '^[+-][^+-]')"
+
+scenario "approve-patch with new, deleted, untracked and oddly named files"
+echo new >d
+printf 'no newline' >e
+git rm -q c
+echo 4 >>a
+printf 'x\n' >"with space"
+review >/dev/null
+expect_eq "approve" "approved c
+approved d
+approved e
+approved with space" "$(review pending-diff c d e "with space" | review approve-patch)"
+expect_eq "pending" "[ ] a" "$(pending)"
+
+scenario "approve-patch from a subdirectory"
+mkdir sub
+echo 4 >>a
+echo 4 >>b
+review >/dev/null
+(cd sub && review pending-diff | review approve-patch >/dev/null)
+expect_code "everything approved" 0 review pending
+
+scenario "approve-patch errors"
+echo 4 >>a
+review >/dev/null
+expect_error "empty patch" "needs a patch on stdin" approve_patch /dev/null
+expect_error "arguments" "takes no arguments" review approve-patch a
+printf 'diff --git a/b b/b\nindex %s..0000000\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-1\n+X\n' "$(git rev-parse HEAD:b)" >"$ROOT/b.patch"
+expect_error "file not under review" "not under review: b" approve_patch "$ROOT/b.patch"
+review pending-diff a | grep -v '^index ' >"$ROOT/noindex.patch"
+expect_error "no index line" "no index line for a" approve_patch "$ROOT/noindex.patch"
+review pending-diff a | sed 's/^ 3$/ three/' >"$ROOT/bad.patch"
+expect_error "does not apply" "does not apply" approve_patch "$ROOT/bad.patch"
+printf 'diff --git a/a b/z\nsimilarity index 100%%\nrename from a\nrename to z\n' >"$ROOT/rename.patch"
+expect_error "renames" "without renames" approve_patch "$ROOT/rename.patch"
+expect_eq "nothing was approved" "[ ] a" "$(pending)"
 
 scenario "unapprove"
 echo 4 >>a

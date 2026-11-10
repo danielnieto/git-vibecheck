@@ -12,14 +12,14 @@ M.config = {
 -- Sent to the agent by `M.impact()`. Avoid `{...}`: sidekick treats it as a template variable.
 M.impact_prompt = table.concat({
   "I'm reviewing this branch file by file with `git vibecheck`. Run `git vibecheck` to see the checklist:",
-  "[x] = approved by me, [ ] = never reviewed, [~] = changed since I approved it.",
+  "[x] = approved by me, [ ] = never reviewed, [~] = partly approved, or changed since I approved it.",
   "For a pending file, `git vibecheck pending-diff <path>` shows exactly the part I have not reviewed yet.",
   "",
   "Tell me which [x] files could be affected by the pending changes: changed signatures, contracts,",
   "return values, side effects, or assumptions the approved code relies on. For each one, name the",
   "pending change and explain why it matters. If nothing is affected, say so.",
   "",
-  "Do not edit any file and do not run `git vibecheck approve` or `git vibecheck unapprove`.",
+  "Do not edit any file and do not run `git vibecheck approve`, `approve-patch` or `unapprove`.",
 }, "\n")
 
 local source = debug.getinfo(1, "S").source:sub(2)
@@ -40,11 +40,17 @@ local function repo_root()
 end
 
 ---@return integer code, string stdout, string stderr
-local function run(root, args)
+local function run(root, args, stdin)
   local cmd = { "bash", bin }
   vim.list_extend(cmd, args)
-  local res = vim.system(cmd, { cwd = root, text = true }):wait()
+  local res = vim.system(cmd, { cwd = root, text = true, stdin = stdin }):wait()
   return res.code, vim.trim(res.stdout or ""), vim.trim(res.stderr or "")
+end
+
+---@return string? stdout, untouched, or nil when git fails
+local function git(root, args)
+  local res = vim.system(vim.list_extend({ "git" }, args), { cwd = root }):wait()
+  return res.code == 0 and res.stdout or nil
 end
 
 -- Like `run`, but if the branch is not under review yet, offers to start it
@@ -149,6 +155,201 @@ end
 
 function M.unapprove()
   with_current_file("unapprove")
+end
+
+local function split_lines(text)
+  local lines = vim.split(text, "\n", { plain = true })
+  if lines[#lines] == "" then
+    lines[#lines] = nil
+  end
+  return lines
+end
+
+local function ends_with_newline(text)
+  return text == "" or text:sub(-1) == "\n"
+end
+
+local function read_file(path)
+  local f = assert(io.open(path, "rb"))
+  local text = f:read("*a")
+  f:close()
+  return text
+end
+
+---@return string[] removed, string[] added
+local function hunk_parts(hunk)
+  local removed, added = {}, {}
+  for _, line in ipairs(hunk.lines) do
+    local list = line:sub(1, 1) == "-" and removed or added
+    list[#list + 1] = line:sub(2)
+  end
+  return removed, added
+end
+
+-- The buffer lines a hunk covers, the way gitsigns' own hunk actions pick it:
+-- a deletion sits on the line above it, or on the first line.
+local function hunk_range(hunk, line_count)
+  local first = math.max(hunk.added.start, 1)
+  local last = math.max(hunk.added.start + hunk.added.count - 1, first)
+  return math.min(first, line_count), math.min(last, line_count)
+end
+
+-- The buffer with every hunk undone, which is the text gitsigns diffed it against.
+local function undo_hunks(lines, hunks)
+  local text = vim.list_slice(lines)
+  for i = #hunks, 1, -1 do
+    local hunk = hunks[i]
+    local removed = hunk_parts(hunk)
+    local at = hunk.added.start + (hunk.added.count == 0 and 1 or 0)
+    for _ = 1, hunk.added.count do
+      table.remove(text, at)
+    end
+    for j = #removed, 1, -1 do
+      table.insert(text, at, removed[j])
+    end
+  end
+  return text
+end
+
+-- Whether git can express the hunk without changing what gitsigns shows. A
+-- file without a final newline marks its last line as such, so a hunk at the
+-- end of the file only works when it replaces the last line of both versions.
+local function fits_end_of_file(hunk, file)
+  local ends_approved = hunk.removed.count > 0 and hunk.removed.start + hunk.removed.count - 1 == file.approved_count
+  local ends_worktree = hunk.added.count > 0 and hunk.added.start + hunk.added.count - 1 == file.line_count
+  if not (ends_approved or ends_worktree) or (file.approved_nl and file.worktree_nl) then
+    return true
+  end
+  return ends_approved and ends_worktree and not file.approved_nl and not file.worktree_nl
+end
+
+-- A git-format patch of the hunks, numbered the way gitsigns numbers the
+-- patches it stages: each hunk's new start includes the hunks before it.
+local function hunk_patch(file, hunks)
+  local name = file.name
+  local out = { ("diff --git a/%s b/%s"):format(name, name) }
+  if file.approved_id then
+    vim.list_extend(out, { ("index %s..%s"):format(file.approved_id, file.worktree_id), "--- a/" .. name })
+  else
+    vim.list_extend(out, { "new file mode " .. file.mode, "index 0000000.." .. file.worktree_id, "--- /dev/null" })
+  end
+  out[#out + 1] = "+++ b/" .. name
+  local no_newline = "\\ No newline at end of file"
+  local offset = 0
+  for _, hunk in ipairs(hunks) do
+    local removed, added = hunk_parts(hunk)
+    local start = hunk.removed.start + (hunk.type == "add" and 1 or 0)
+    local old_start = file.approved_id and start or 0
+    out[#out + 1] = ("@@ -%d,%d +%d,%d @@"):format(old_start, #removed, start + offset, #added)
+    for _, line in ipairs(removed) do
+      out[#out + 1] = "-" .. line
+    end
+    if not file.approved_nl and #removed > 0 and hunk.removed.start + #removed - 1 == file.approved_count then
+      out[#out + 1] = no_newline
+    end
+    for _, line in ipairs(added) do
+      out[#out + 1] = "+" .. line
+    end
+    if not file.worktree_nl and #added > 0 and hunk.added.start + #added - 1 == file.line_count then
+      out[#out + 1] = no_newline
+    end
+    offset = offset + #added - #removed
+  end
+  return table.concat(out, "\n") .. "\n"
+end
+
+local function approve_hunks(root, name, buf, ref, first, last)
+  local hunks = require("gitsigns").get_hunks(buf)
+  if not hunks then
+    return notify("gitsigns is not tracking this file", vim.log.levels.WARN)
+  end
+  local approved_id = git(root, { "rev-parse", "-q", "--verify", ref .. ":" .. name })
+  approved_id = approved_id and vim.trim(approved_id)
+  local approved = approved_id and git(root, { "cat-file", "blob", approved_id }) or ""
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  if not vim.deep_equal(undo_hunks(lines, hunks), split_lines(approved)) then
+    return notify("The gutter does not match the review; try again, or approve the whole file", vim.log.levels.WARN)
+  end
+
+  local path = vim.fs.joinpath(root, name)
+  local file = {
+    name = name,
+    approved_id = approved_id,
+    worktree_id = vim.trim(git(root, { "hash-object", "--", name }) or ""),
+    mode = bit.band(assert(vim.uv.fs_stat(path)).mode, tonumber("111", 8)) ~= 0 and "100755" or "100644",
+    approved_count = #split_lines(approved),
+    line_count = #lines,
+    approved_nl = ends_with_newline(approved),
+    worktree_nl = ends_with_newline(read_file(path)),
+  }
+  if #hunks == 0 then
+    if file.approved_nl ~= file.worktree_nl then
+      return notify("Only the newline at the end of the file is left; approve the whole file", vim.log.levels.WARN)
+    end
+    return notify("Nothing left to approve in this file")
+  end
+  local chosen = vim.tbl_filter(function(hunk)
+    local hunk_first, hunk_last = hunk_range(hunk, #lines)
+    return hunk_first <= last and hunk_last >= first
+  end, hunks)
+  if #chosen == 0 then
+    return notify("No pending hunk here", vim.log.levels.WARN)
+  end
+  for _, hunk in ipairs(chosen) do
+    if not fits_end_of_file(hunk, file) then
+      return notify(
+        "This hunk changes the end of a file without a final newline; approve the whole file",
+        vim.log.levels.WARN
+      )
+    end
+  end
+
+  local code, out, err = run(root, { "approve-patch" }, hunk_patch(file, chosen))
+  if code ~= 0 then
+    return notify(err ~= "" and err or out, vim.log.levels.ERROR)
+  end
+  notify(out)
+  refresh_gutter(root)
+end
+
+-- Approves the hunk under the cursor, or every hunk that touches the lines in
+-- `range` ({ first, last }), exactly as gitsigns shows them against the review.
+function M.approve_hunk(range)
+  local ok, gitsigns = pcall(require, "gitsigns")
+  if not ok then
+    return notify("Requires gitsigns.nvim", vim.log.levels.WARN)
+  end
+  local root = repo_root()
+  if not root then
+    return notify("Not inside a git repository", vim.log.levels.WARN)
+  end
+  local name = current_file(root)
+  if not name then
+    return notify("This buffer is not a file in the repository", vim.log.levels.WARN)
+  end
+  local buf = vim.api.nvim_get_current_buf()
+  local cursor = vim.fn.line(".")
+  local first, last = unpack(range or { cursor, cursor })
+  write_if_modified(vim.fs.joinpath(root, name))
+  local code, _, err = run_started(root, { "pending" })
+  if code == nil then
+    return
+  elseif code == 0 then
+    return notify("Nothing left to review")
+  elseif code > 1 then
+    return notify(err, vim.log.levels.ERROR)
+  end
+  local ref = review_ref(root)
+  gutter_on = true
+  -- Re-read the base first, so the hunks are against what is approved now.
+  gitsigns.change_base(ref, true, function(change_err)
+    vim.schedule(function()
+      if change_err then
+        return notify(change_err, vim.log.levels.ERROR)
+      end
+      approve_hunks(root, name, buf, ref, first, last)
+    end)
+  end)
 end
 
 function M.next_pending()
@@ -307,6 +508,12 @@ function M.setup(opts)
   map("r", M.tracker, "Review checklist")
   map("a", M.approve, "Approve file")
   map("u", M.unapprove, "Unapprove file")
+  map("h", M.approve_hunk, "Approve hunk")
+  vim.keymap.set("x", prefix .. "h", function()
+    local first, last = vim.fn.line("v"), vim.fn.line(".")
+    vim.api.nvim_feedkeys(vim.keycode("<Esc>"), "nx", false)
+    M.approve_hunk({ math.min(first, last), math.max(first, last) })
+  end, { desc = "Approve hunks in selection" })
   map("n", M.next_pending, "Next pending file")
   map("d", M.toggle_gutter, "Toggle gutter: pending only")
   if has_sidekick() then
