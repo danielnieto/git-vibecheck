@@ -12,7 +12,8 @@ M.config = {
 -- Sent to the agent by `M.impact()`. Avoid `{...}`: sidekick treats it as a template variable.
 M.impact_prompt = table.concat({
   "I'm reviewing this branch file by file with `git vibecheck`. Run `git vibecheck` to see the checklist:",
-  "[x] = approved by me, [ ] = never reviewed, [~] = partly approved, or changed since I approved it.",
+  "[x] = approved by me, [-] = partly approved by me, [~] = changed since I last approved any of it,",
+  "[ ] = never reviewed.",
   "For a pending file, `git vibecheck pending-diff <path>` shows exactly the part I have not reviewed yet.",
   "",
   "Tell me which [x] files could be affected by the pending changes: changed signatures, contracts,",
@@ -25,7 +26,7 @@ M.impact_prompt = table.concat({
 local source = debug.getinfo(1, "S").source:sub(2)
 local bin = vim.fs.joinpath(vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(source))), "bin", "git-vibecheck")
 
-local mark_hl = { x = "DiagnosticOk", ["~"] = "DiagnosticWarn", [" "] = "DiagnosticHint" }
+local mark_hl = { x = "DiagnosticOk", ["-"] = "DiagnosticInfo", ["~"] = "DiagnosticWarn", [" "] = "DiagnosticHint" }
 
 local gutter_on = false
 

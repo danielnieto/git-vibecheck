@@ -220,7 +220,7 @@ status_before=$(git status --porcelain)
 head_before=$(git rev-parse HEAD)
 review >/dev/null
 expect_eq "approve the second hunk" "approved part of f" "$(review pending-diff f | nth_hunk 2 | review approve-patch)"
-expect_eq "pending" "[~] f" "$(pending)"
+expect_eq "pending" "[-] f" "$(pending)"
 expect_eq "only the first hunk is left" "-2
 +TWO" "$(review pending-diff f | grep '^[+-][^+-]')"
 expect_eq "approve the rest" "approved f" "$(review pending-diff f | review approve-patch)"
@@ -267,6 +267,63 @@ echo 4 >>b
 review >/dev/null
 (cd sub && review pending-diff | review approve-patch >/dev/null)
 expect_code "everything approved" 0 review pending
+
+scenario "partly approved until the file changes again"
+long_file
+change_f_twice
+review >/dev/null
+review pending-diff f | nth_hunk 1 | review approve-patch >/dev/null
+expect_eq "partly approved" "[-] f" "$(pending)"
+{
+  echo 1
+  echo TWO
+  seq 3 9
+  echo TEN
+  seq 11 17
+  echo EIGHTEEN
+  seq 19 20
+} >f
+expect_eq "changed since" "[~] f" "$(pending)"
+change_f_twice
+expect_eq "back to what was seen" "[-] f" "$(pending)"
+review unapprove f >/dev/null
+expect_eq "unapproved" "[ ] f" "$(pending)"
+review approve f >/dev/null
+echo 21 >>f
+expect_eq "changed after a full approval" "[~] f" "$(pending)"
+
+scenario "a partial approval survives a rebase"
+long_file
+change_f_twice
+git commit -qam "change f"
+review >/dev/null
+review pending-diff f | nth_hunk 1 | review approve-patch >/dev/null
+git switch -q main
+echo e >e
+git add e
+git commit -qm "main moves"
+git switch -q feat
+git rebase -q main
+expect_eq "still partly approved" "[-] f" "$(pending)"
+
+scenario "partial approval from a subdirectory records what was seen"
+long_file
+change_f_twice
+mkdir sub
+review >/dev/null
+(cd sub && review pending-diff ../f | nth_hunk 1 | review approve-patch >/dev/null)
+expect_eq "partly approved" "[-] f" "$(pending)"
+
+scenario "a review written before partial approvals were recorded"
+long_file
+change_f_twice
+review >/dev/null
+review pending-diff f | nth_hunk 1 | review approve-patch >/dev/null
+git update-ref refs/review/feat "$(git commit-tree -p refs/review/feat^1 -m old refs/review/feat^{tree})"
+expect_eq "partial shows as changed, as it used to" "[~] f" "$(pending)"
+review pending-diff f | review approve-patch >/dev/null
+expect_code "approving still works" 0 review pending
+expect_code "and records what was seen from then on" 0 git rev-parse -q --verify refs/review/feat^2
 
 scenario "approve-patch errors"
 echo 4 >>a

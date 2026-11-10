@@ -14,13 +14,18 @@ $ git vibecheck
 nieto/my-branch vs origin/main: 9/12 approved
 
 [x] app/models.py
+[-] app/prompts.py
 [~] app/runner.py
 [ ] app/verdict.py
 ...
 ```
 
-`[x]` approved, `[ ]` never reviewed, `[~]` partly approved, or changed since
-you approved it.
+| Mark  | Meaning                                                           |
+| ----- | ----------------------------------------------------------------- |
+| `[x]` | Approved, and unchanged since                                     |
+| `[-]` | Partly approved (some hunks), and unchanged since                 |
+| `[~]` | Changed since you last approved any of it (you, an agent, a rebase) |
+| `[ ]` | Never reviewed                                                    |
 
 ## Install
 
@@ -152,7 +157,9 @@ Approvals live in a local ref, `refs/review/<branch>`, that is never pushed. It
 points to a commit whose parent is the branch's merge base and whose tree is
 that base with every approved file overlaid at the content it had when
 approved, or, for a file approved hunk by hunk, the base plus those hunks. A
-file is approved while your working tree matches that overlay.
+file is approved while your working tree matches that overlay. A second parent
+records each file as your working tree had it the last time you approved any
+of it: a file that still matches it is `[-]`, one that does not is `[~]`.
 
 Your index, stash and commits are never touched: the working tree is
 snapshotted through a throwaway copy of the index. When a rebase or merge moves

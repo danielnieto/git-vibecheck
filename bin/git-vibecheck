@@ -6,8 +6,10 @@
 # merge base and whose tree is that base with every approved file overlaid at
 # the content it had when approved (or, for a file approved hunk by hunk, the
 # base plus the approved hunks). A file is approved only while the working tree
-# matches that overlay, so any later edit sends it back to pending. Commits,
-# the index and the stash are never touched.
+# matches that overlay, so any later edit sends it back to pending. A second
+# parent records each file as it was the last time any of it was approved,
+# which tells a partly approved file from one that changed since. Commits, the
+# index and the stash are never touched.
 #
 # Must stay compatible with bash 3.2 (the macOS /bin/bash).
 
@@ -22,7 +24,7 @@ usage: git vibecheck [--base <branch>]     start reviewing this branch, or show 
    or: git vibecheck approve <path>...     approve files at their current content
    or: git vibecheck unapprove <path>...   send approved files back to pending
 
-  [x] approved   [ ] never reviewed   [~] partly approved, or changed since approved
+  [x] approved   [-] partly approved   [~] changed since approved   [ ] never reviewed
 
 `git vibecheck pending` exits 0 only when nothing is left to review.
 
@@ -65,18 +67,31 @@ require_started() {
   [ "$state" != "$zero" ] || die "this branch is not under review; run \`git vibecheck\` to start" "$NOT_STARTED"
 }
 
-# Point the review ref at <tree>, recording <parent> (the merge base the tree
-# was built on) so later runs can tell when a rebase or merge moved it.
+commit_tree() {
+  GIT_AUTHOR_NAME=git-vibecheck GIT_AUTHOR_EMAIL=git-vibecheck@localhost \
+    GIT_COMMITTER_NAME=git-vibecheck GIT_COMMITTER_EMAIL=git-vibecheck@localhost \
+    git commit-tree "$@" -m "git vibecheck: $branch"
+}
+
+# Point the review ref at a commit of <tree>, the approved content. Its first
+# parent is <parent>, the merge base both trees were built on, so later runs
+# can tell when a rebase or merge moved it. Its second parent is a commit of
+# <seen>: each file as the working tree had it the last time any of it was
+# approved.
 write_ref() {
-  local tree=$1 parent=$2 commit
-  commit=$(
-    GIT_AUTHOR_NAME=git-vibecheck GIT_AUTHOR_EMAIL=git-vibecheck@localhost \
-      GIT_COMMITTER_NAME=git-vibecheck GIT_COMMITTER_EMAIL=git-vibecheck@localhost \
-      git commit-tree "$tree" -p "$parent" -m "git vibecheck: $branch"
-  )
+  local tree=$1 seen=$2 parent=$3 seen_commit commit
+  seen_commit=$(commit_tree "$seen" -p "$parent")
+  commit=$(commit_tree "$tree" -p "$parent" -p "$seen_commit")
   git update-ref -m "git vibecheck" "$ref" "$commit" "$state" 2>/dev/null ||
     die "the review changed while this command ran; try again"
   state=$commit
+}
+
+# The tree of what was last seen. A review written before that was recorded has
+# no second parent; its own tree stands in, so a partly approved file shows as
+# changed, as it did then.
+seen_tree() {
+  git rev-parse -q --verify "$state^2^{tree}" || git rev-parse "$state^{tree}"
 }
 
 # Print `git update-index --index-info` lines that turn <from> into <to> for
@@ -92,26 +107,44 @@ index_info() {
     }'
 }
 
-# Copy the entries matching the pathspecs from <source> into the review tree.
+# Print <tree> with the entries matching the pathspecs taken from <source>.
+overlay_tree() {
+  local tree=$1 source=$2 index="$tmp/overlay.index"
+  shift 2
+  GIT_INDEX_FILE=$index git read-tree "$tree"
+  index_info "$tree" "$source" "$@" | GIT_INDEX_FILE=$index git -C "$top" update-index --index-info
+  GIT_INDEX_FILE=$index git write-tree
+}
+
+# Record the entries matching the pathspecs at their content in <source>, as
+# both approved and seen: the working tree to approve, the base to unapprove.
 overlay() {
-  local source=$1 index="$tmp/overlay.index"
+  local source=$1 tree seen
   shift
-  GIT_INDEX_FILE=$index git read-tree "$ref"
-  index_info "$ref" "$source" "$@" | GIT_INDEX_FILE=$index git -C "$top" update-index --index-info
-  write_ref "$(GIT_INDEX_FILE=$index git write-tree)" "$base"
+  tree=$(overlay_tree "$ref" "$source" "$@")
+  seen=$(overlay_tree "$(seen_tree)" "$source" "$@")
+  write_ref "$tree" "$seen" "$base"
+}
+
+# Print <tree>'s changes from <old base> redone on top of the current base.
+rebase_tree() {
+  local old_base=$1 tree=$2 index="$tmp/sync.index"
+  GIT_INDEX_FILE=$index git read-tree "$base"
+  index_info "$old_base" "$tree" | GIT_INDEX_FILE=$index git -C "$top" update-index --index-info
+  GIT_INDEX_FILE=$index git write-tree
 }
 
 # Set $base to the current merge base, first rebuilding the review tree on top
 # of it if it moved, so never-reviewed files keep comparing against the base
 # the branch actually has now while approvals carry over.
 sync_base() {
-  local old_base index="$tmp/sync.index"
+  local old_base tree seen
   base=$(merge_base)
   old_base=$(git rev-parse "$ref^1")
   if [ "$old_base" != "$base" ]; then
-    GIT_INDEX_FILE=$index git read-tree "$base"
-    index_info "$old_base" "$ref" | GIT_INDEX_FILE=$index git -C "$top" update-index --index-info
-    write_ref "$(GIT_INDEX_FILE=$index git write-tree)" "$base"
+    tree=$(rebase_tree "$old_base" "$ref")
+    seen=$(rebase_tree "$old_base" "$(seen_tree)")
+    write_ref "$tree" "$seen" "$base"
   fi
 }
 
@@ -132,18 +165,26 @@ checklist() {
   local worktree=$1
   g diff-tree -r --name-only --no-renames "$ref" "$worktree" >"$tmp/pending"
   g diff-tree -r --name-only --no-renames "$base" "$ref" >"$tmp/approved"
+  g diff-tree -r --name-only --no-renames "$(seen_tree)" "$worktree" >"$tmp/moved"
   g diff-tree -r --name-only --no-renames "$base" "$worktree" |
-    awk -v pending="$tmp/pending" -v approved="$tmp/approved" '
+    awk -v pending="$tmp/pending" -v approved="$tmp/approved" -v moved="$tmp/moved" '
       BEGIN {
         while ((getline line < pending) > 0) p[line] = 1
         while ((getline line < approved) > 0) a[line] = 1
+        while ((getline line < moved) > 0) m[line] = 1
       }
-      { print (!($0 in p) ? "[x]" : ($0 in a) ? "[~]" : "[ ]") " " $0 }
+      {
+        if (!($0 in p)) mark = "[x]"
+        else if (!($0 in a)) mark = "[ ]"
+        else if ($0 in m) mark = "[~]"
+        else mark = "[-]"
+        print mark " " $0
+      }
     '
 }
 
 cmd_start() {
-  local requested=$1 list="$tmp/list" total approved
+  local requested=$1 list="$tmp/list" total approved tree
   if [ -n "$requested" ]; then
     git rev-parse -q --verify "$requested^{commit}" >/dev/null || die "unknown base: $requested"
     git config "$base_key" "$requested"
@@ -153,7 +194,8 @@ cmd_start() {
 
   if [ "$state" = "$zero" ]; then
     base=$(merge_base)
-    write_ref "$(git rev-parse "$base^{tree}")" "$base"
+    tree=$(git rev-parse "$base^{tree}")
+    write_ref "$tree" "$tree" "$base"
   else
     sync_base
   fi
@@ -261,7 +303,7 @@ patch_files() {
 # patch made before the review changed is refused instead of landing on
 # content it was not made for.
 cmd_approve_patch() {
-  local patch="$tmp/patch" index="$tmp/patch.index" worktree old path approved current
+  local patch="$tmp/patch" index="$tmp/patch.index" worktree old path approved current tree seen
   [ $# -eq 0 ] || die "approve-patch takes no arguments; pipe the patch to it"
   require_started
   sync_base
@@ -290,7 +332,13 @@ cmd_approve_patch() {
     cat "$tmp/apply.err" >&2
     die "the patch does not apply to what you approved"
   }
-  write_ref "$(GIT_INDEX_FILE=$index git write-tree)" "$base"
+  tree=$(GIT_INDEX_FILE=$index git write-tree)
+  set --
+  while IFS=$'\t' read -r old path; do
+    set -- "$@" ":(top,literal)$path"
+  done <"$tmp/files"
+  seen=$(overlay_tree "$(seen_tree)" "$worktree" "$@")
+  write_ref "$tree" "$seen" "$base"
 
   while IFS=$'\t' read -r old path; do
     approved=$(git rev-parse -q --verify "$state:$path" || echo "$zero")
