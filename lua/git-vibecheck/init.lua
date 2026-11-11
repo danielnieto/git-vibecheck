@@ -177,6 +177,11 @@ local function read_file(path)
   return text
 end
 
+local function empty_on_disk(path)
+  local stat = vim.uv.fs_stat(path)
+  return stat == nil or stat.size == 0
+end
+
 ---@return string[] removed, string[] added
 local function hunk_parts(hunk)
   local removed, added = {}, {}
@@ -259,58 +264,107 @@ local function hunk_patch(file, hunks)
   return table.concat(out, "\n") .. "\n"
 end
 
-local function approve_hunks(root, name, buf, ref, first, last)
-  local hunks = require("gitsigns").get_hunks(buf)
-  if not hunks then
-    return notify("gitsigns is not tracking this file", vim.log.levels.WARN)
+-- Gitsigns recomputes hunks asynchronously after a base change, so right
+-- after `change_base` it still describes the base it had before. Only patches
+-- made from hunks that diff the buffer against what is approved right now are
+-- safe to apply, so wait for them.
+local function when_hunks_match(buf, approved, attempt, cb)
+  if not vim.api.nvim_buf_is_valid(buf) then
+    return
   end
+  local hunks = require("gitsigns").get_hunks(buf)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  if hunks and vim.deep_equal(undo_hunks(lines, hunks), split_lines(approved)) then
+    return cb(hunks, lines)
+  end
+  attempt = attempt or 0
+  if attempt >= 80 then
+    return notify("The gutter does not match the review; try again, or approve the whole file", vim.log.levels.WARN)
+  end
+  vim.defer_fn(function()
+    when_hunks_match(buf, approved, attempt + 1, cb)
+  end, 25)
+end
+
+local function approve_hunks(root, name, buf, ref, first, last)
+  if not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  local path = vim.fs.joinpath(root, name)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  -- An empty file is a single empty line in the buffer, which gitsigns cannot
+  -- express as a hunk: the patch would add a newline that is not there. There
+  -- is nothing to pick, so approve the empty file as a whole.
+  if #lines == 1 and lines[1] == "" and empty_on_disk(path) then
+    return set_mark(root, "approve", { name })
+  end
+
   local approved_id = git(root, { "rev-parse", "-q", "--verify", ref .. ":" .. name })
   approved_id = approved_id and vim.trim(approved_id)
   local approved = approved_id and git(root, { "cat-file", "blob", approved_id }) or ""
-  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  if not vim.deep_equal(undo_hunks(lines, hunks), split_lines(approved)) then
-    return notify("The gutter does not match the review; try again, or approve the whole file", vim.log.levels.WARN)
-  end
-
-  local path = vim.fs.joinpath(root, name)
-  local file = {
-    name = name,
-    approved_id = approved_id,
-    worktree_id = vim.trim(git(root, { "hash-object", "--", name }) or ""),
-    mode = bit.band(assert(vim.uv.fs_stat(path)).mode, tonumber("111", 8)) ~= 0 and "100755" or "100644",
-    approved_count = #split_lines(approved),
-    line_count = #lines,
-    approved_nl = ends_with_newline(approved),
-    worktree_nl = ends_with_newline(read_file(path)),
-  }
-  if #hunks == 0 then
-    if file.approved_nl ~= file.worktree_nl then
-      return notify("Only the newline at the end of the file is left; approve the whole file", vim.log.levels.WARN)
+  when_hunks_match(buf, approved, 0, function(hunks, current)
+    local file = {
+      name = name,
+      approved_id = approved_id,
+      worktree_id = vim.trim(git(root, { "hash-object", "--", name }) or ""),
+      mode = bit.band(assert(vim.uv.fs_stat(path)).mode, tonumber("111", 8)) ~= 0 and "100755" or "100644",
+      approved_count = #split_lines(approved),
+      line_count = #current,
+      approved_nl = ends_with_newline(approved),
+      worktree_nl = ends_with_newline(read_file(path)),
+    }
+    if #hunks == 0 then
+      if file.approved_nl ~= file.worktree_nl then
+        return notify("Only the newline at the end of the file is left; approve the whole file", vim.log.levels.WARN)
+      end
+      return notify("Nothing left to approve in this file")
     end
-    return notify("Nothing left to approve in this file")
-  end
-  local chosen = vim.tbl_filter(function(hunk)
-    local hunk_first, hunk_last = hunk_range(hunk, #lines)
-    return hunk_first <= last and hunk_last >= first
-  end, hunks)
-  if #chosen == 0 then
-    return notify("No pending hunk here", vim.log.levels.WARN)
-  end
-  for _, hunk in ipairs(chosen) do
-    if not fits_end_of_file(hunk, file) then
-      return notify(
-        "This hunk changes the end of a file without a final newline; approve the whole file",
-        vim.log.levels.WARN
-      )
+    local chosen = vim.tbl_filter(function(hunk)
+      local hunk_first, hunk_last = hunk_range(hunk, #current)
+      return hunk_first <= last and hunk_last >= first
+    end, hunks)
+    if #chosen == 0 then
+      return notify("No pending hunk here", vim.log.levels.WARN)
     end
-  end
+    for _, hunk in ipairs(chosen) do
+      if not fits_end_of_file(hunk, file) then
+        return notify(
+          "This hunk changes the end of a file without a final newline; approve the whole file",
+          vim.log.levels.WARN
+        )
+      end
+    end
 
-  local code, out, err = run(root, { "approve-patch" }, hunk_patch(file, chosen))
-  if code ~= 0 then
-    return notify(err ~= "" and err or out, vim.log.levels.ERROR)
+    local code, out, err = run(root, { "approve-patch" }, hunk_patch(file, chosen))
+    if code ~= 0 then
+      return notify(err ~= "" and err or out, vim.log.levels.ERROR)
+    end
+    notify(out)
+    refresh_gutter(root)
+  end)
+end
+
+-- Gitsigns skips untracked files by default, and drops an attach call made
+-- while it is already attaching the buffer, so retry until it is attached.
+local function when_attached(buf, deadline, cb)
+  local gitsigns = require("gitsigns")
+  if gitsigns.get_hunks(buf) ~= nil then
+    return cb()
   end
-  notify(out)
-  refresh_gutter(root)
+  if vim.uv.now() >= deadline then
+    return notify("gitsigns is not tracking this file", vim.log.levels.WARN)
+  end
+  gitsigns.attach({ bufnr = buf, force = true }, function(attach_err)
+    if attach_err then
+      return notify(attach_err, vim.log.levels.ERROR)
+    end
+    if gitsigns.get_hunks(buf) ~= nil then
+      return cb()
+    end
+    vim.defer_fn(function()
+      when_attached(buf, deadline, cb)
+    end, 50)
+  end)
 end
 
 -- Approves the hunk under the cursor, or every hunk that touches the lines in
@@ -341,16 +395,26 @@ function M.approve_hunk(range)
     return notify(err, vim.log.levels.ERROR)
   end
   local ref = review_ref(root)
+  if not ref then
+    return notify("HEAD is not a branch", vim.log.levels.WARN)
+  end
   gutter_on = true
-  -- Re-read the base first, so the hunks are against what is approved now.
-  gitsigns.change_base(ref, true, function(change_err)
-    vim.schedule(function()
-      if change_err then
-        return notify(change_err, vim.log.levels.ERROR)
-      end
-      approve_hunks(root, name, buf, ref, first, last)
+
+  local function approve()
+    -- Re-read the base first, so the hunks are against what is approved now.
+    gitsigns.change_base(ref, true, function(change_err)
+      vim.schedule(function()
+        if change_err then
+          return notify(change_err, vim.log.levels.ERROR)
+        end
+        approve_hunks(root, name, buf, ref, first, last)
+      end)
     end)
-  end)
+  end
+
+  -- gitsigns leaves untracked files alone by default, but a new file is
+  -- reviewed hunk by hunk like any other.
+  when_attached(buf, vim.uv.now() + 2000, approve)
 end
 
 function M.next_pending()

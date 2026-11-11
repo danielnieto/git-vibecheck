@@ -57,8 +57,9 @@ git vibecheck unapprove <path>...   send approved files back to pending
   untracked and deleted files alike. Commit as often as you like.
 - `--base` is for stacked branches. It is remembered per branch.
 - Paths work like git pathspecs: relative to your current directory, and
-  directories approve everything inside them. `git vibecheck approve .` approves
-  everything, but only because you asked for it.
+  directories approve everything inside them. From the repository root,
+  `git vibecheck approve .` approves everything, but only because you asked for
+  it.
 - `git vibecheck pending` exits 0 only when nothing is left, so agents and scripts
   can check whether you are done.
 
@@ -108,8 +109,9 @@ to start it.
 
 `<leader>gvh` turns on the review gutter and approves exactly the hunks
 gitsigns shows there, however your `diffopt` cuts them (with `linematch`, one
-changed block can be several hunks). Before approving, it checks that those
-hunks are against what is approved right now, and refuses otherwise.
+changed block can be several hunks). It attaches gitsigns to untracked files on
+demand, so a new file works like any other. Before approving, it checks that
+those hunks are against what is approved right now, and refuses otherwise.
 
 Options:
 
@@ -179,6 +181,10 @@ over.
 ## Tests
 
 ```sh
-test/run.sh                    # with the bash on your PATH
-TEST_BASH=/bin/bash test/run.sh  # macOS bash 3.2
+test/run.sh                       # with the bash on your PATH
+TEST_BASH=/bin/bash test/run.sh   # macOS bash 3.2
+test/nvim.sh                      # hunk approval, needs nvim and gitsigns.nvim
 ```
+
+`test/nvim.sh` looks for gitsigns in lazy's directory; set `GITSIGNS_PATH` (and
+`NVIM_BIN`, if nvim is not on your PATH) to point it elsewhere.
