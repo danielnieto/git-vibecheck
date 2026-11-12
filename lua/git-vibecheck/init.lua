@@ -7,6 +7,12 @@ M.config = {
   -- Prefix for the default keymaps. Set `keys = false` to map the functions yourself.
   prefix = "<leader>gv",
   keys = true,
+  -- The review gutter draws its own signs, so gitsigns' keep showing your usual diff.
+  gutter = {
+    signs = { add = "+", change = "~", delete = "_", topdelete = "‾" },
+    -- When signs share a column, the highest priority shows: gitsigns uses 6, diagnostics 10.
+    priority = 7,
+  },
 }
 
 -- Sent to the agent by `M.impact()`. Avoid `{...}`: sidekick treats it as a template variable.
@@ -28,7 +34,10 @@ local bin = vim.fs.joinpath(vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(source)
 
 local mark_hl = { x = "DiagnosticOk", ["-"] = "DiagnosticInfo", ["~"] = "DiagnosticWarn", [" "] = "DiagnosticHint" }
 
-local gutter_on = false
+local sign_hl =
+  { add = "GitReviewAdd", change = "GitReviewChange", delete = "GitReviewDelete", topdelete = "GitReviewDelete" }
+
+local ns = vim.api.nvim_create_namespace("git-vibecheck")
 
 local function notify(msg, level)
   vim.notify(msg, level or vim.log.levels.INFO, { title = "git vibecheck" })
@@ -96,11 +105,237 @@ local function review_ref(root)
   return res.code == 0 and "refs/review/" .. vim.trim(res.stdout) or nil
 end
 
-local function refresh_gutter(root)
-  local ok, gitsigns = pcall(require, "gitsigns")
-  if gutter_on and ok then
-    gitsigns.change_base(review_ref(root), true)
+local function split_lines(text)
+  local lines = vim.split(text, "\n", { plain = true })
+  if lines[#lines] == "" then
+    lines[#lines] = nil
   end
+  return lines
+end
+
+local function ends_with_newline(text)
+  return text == "" or text:sub(-1) == "\n"
+end
+
+local function read_file(path)
+  local f = assert(io.open(path, "rb"))
+  local text = f:read("*a")
+  f:close()
+  return text
+end
+
+local function empty_on_disk(path)
+  local stat = vim.uv.fs_stat(path)
+  return stat == nil or stat.size == 0
+end
+
+-- An empty file is still one empty line in the buffer.
+local function buffer_lines(buf, path)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  if #lines == 1 and lines[1] == "" and empty_on_disk(path) then
+    return {}
+  end
+  return lines
+end
+
+local function diff_opts()
+  local opts = { result_type = "indices" }
+  for _, item in ipairs(vim.split(vim.o.diffopt, ",", { plain = true })) do
+    local key, value = item:match("^([^:]+):(.*)$")
+    if item == "indent-heuristic" then
+      opts.indent_heuristic = true
+    elseif key == "algorithm" then
+      opts.algorithm = value
+    elseif key == "linematch" then
+      opts.linematch = tonumber(value)
+    end
+  end
+  return opts
+end
+
+-- The hunks from `old` to `new` as { old_start, old_count, new_start, new_count },
+-- numbered like a unified diff and cut the way 'diffopt' cuts them (with
+-- linematch, one changed block can be several hunks). Whitespace options are
+-- left out: a hunk the gutter hid could never be approved.
+local function diff(old, new)
+  local function text(lines)
+    return #lines == 0 and "" or table.concat(lines, "\n") .. "\n"
+  end
+  return vim.diff(text(old), text(new), diff_opts())
+end
+
+-- The review gutter. Gitsigns keeps diffing against its usual base; this draws
+-- separate signs for what is left to review: the buffer against the review ref.
+
+local gutter_on = false
+local gutter_group
+
+-- buffer -> false when it is not a file in a repository, else
+-- { root, name, reviewed = lines the review compares it against (nil when the
+-- file is not under review), hunks = the hunks drawn }. Emptied whenever the
+-- review may have changed; visible buffers are reloaded right away, the rest
+-- when they are shown.
+local buffers = {}
+local attached = {}
+local draw_queued = {}
+
+local function file_of(buf)
+  local path = vim.api.nvim_buf_get_name(buf)
+  if path == "" or vim.bo[buf].buftype ~= "" or path:match("^%a[%w+.-]*://") then
+    return nil
+  end
+  local root = vim.fs.root(path, ".git")
+  local name = root and vim.fs.relpath(root, path)
+  if not name then
+    return nil
+  end
+  return root, name
+end
+
+-- What the review compares a file against: the content approved, the base for
+-- a file never approved, nothing for a new one. nil when the branch is not
+-- under review, or when git ignores the file.
+---@return string[]?
+local function reviewed_lines(root, name)
+  local ref = review_ref(root)
+  if not ref then
+    return nil
+  end
+  local text = git(root, { "cat-file", "blob", ref .. ":" .. name })
+  if text then
+    return split_lines(text)
+  end
+  if not git(root, { "rev-parse", "-q", "--verify", ref }) or git(root, { "check-ignore", "-q", "--", name }) then
+    return nil
+  end
+  return {}
+end
+
+local function draw(buf)
+  local state = buffers[buf]
+  if not (gutter_on and state and vim.api.nvim_buf_is_loaded(buf)) then
+    return
+  end
+  vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  state.hunks = state.reviewed and diff(state.reviewed, buffer_lines(buf, vim.fs.joinpath(state.root, state.name)))
+  local signs, priority = M.config.gutter.signs, M.config.gutter.priority
+  local function sign(lnum, kind)
+    vim.api.nvim_buf_set_extmark(buf, ns, lnum - 1, 0, {
+      sign_text = signs[kind],
+      sign_hl_group = sign_hl[kind],
+      priority = priority,
+    })
+  end
+  -- A deletion is marked on the line above it, or on the first line.
+  for _, hunk in ipairs(state.hunks or {}) do
+    local _, old_count, new_start, new_count = unpack(hunk)
+    if new_count == 0 then
+      sign(math.max(new_start, 1), new_start == 0 and "topdelete" or "delete")
+    else
+      for lnum = new_start, new_start + new_count - 1 do
+        sign(lnum, old_count == 0 and "add" or "change")
+      end
+    end
+  end
+end
+
+local function queue_draw(buf)
+  if draw_queued[buf] then
+    return
+  end
+  draw_queued[buf] = true
+  vim.defer_fn(function()
+    draw_queued[buf] = nil
+    draw(buf)
+  end, 50)
+end
+
+local function attach(buf)
+  if attached[buf] then
+    return
+  end
+  attached[buf] = vim.api.nvim_buf_attach(buf, false, {
+    on_lines = function()
+      if not gutter_on then
+        attached[buf] = nil
+        return true
+      end
+      queue_draw(buf)
+    end,
+    on_reload = function()
+      queue_draw(buf)
+    end,
+    on_detach = function()
+      attached[buf] = nil
+      buffers[buf] = nil
+    end,
+  }) or nil
+end
+
+local function load_buffer(buf)
+  local root, name = file_of(buf)
+  if not root then
+    buffers[buf] = false
+    return
+  end
+  buffers[buf] = { root = root, name = name, reviewed = reviewed_lines(root, name) }
+  attach(buf)
+  draw(buf)
+end
+
+local function load_visible()
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    local buf = vim.api.nvim_win_get_buf(win)
+    if buffers[buf] == nil then
+      load_buffer(buf)
+    end
+  end
+end
+
+-- The review may have changed (an approval, a commit, a rebase): read it again.
+local function reload_gutter()
+  if gutter_on then
+    buffers = {}
+    load_visible()
+  end
+end
+
+local function set_highlights()
+  for _, group in pairs(sign_hl) do
+    vim.api.nvim_set_hl(0, group, { link = "DiagnosticWarn", default = true })
+  end
+end
+
+local function gutter_enable()
+  if gutter_on then
+    return reload_gutter()
+  end
+  gutter_on = true
+  set_highlights()
+  gutter_group = vim.api.nvim_create_augroup("git-vibecheck-gutter", { clear = true })
+  local function autocmd(events, fn)
+    vim.api.nvim_create_autocmd(events, { group = gutter_group, callback = fn })
+  end
+  autocmd({ "BufEnter", "BufWinEnter", "WinEnter", "TabEnter" }, load_visible)
+  -- Approving from a terminal, committing or rebasing changes the review.
+  autocmd({ "FocusGained", "ShellCmdPost", "TermLeave" }, reload_gutter)
+  autocmd("BufFilePost", function(ev)
+    buffers[ev.buf] = nil
+    load_visible()
+  end)
+  autocmd("ColorScheme", set_highlights)
+  reload_gutter()
+end
+
+local function gutter_disable()
+  gutter_on = false
+  vim.api.nvim_del_augroup_by_id(gutter_group)
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(buf) then
+      vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+    end
+  end
+  buffers = {}
 end
 
 -- Approving must record what the user sees, so unsaved edits are written first.
@@ -134,7 +369,7 @@ local function set_mark(root, action, files)
     notify(err ~= "" and err or out, vim.log.levels.ERROR)
   else
     notify(out)
-    refresh_gutter(root)
+    reload_gutter()
   end
 end
 
@@ -158,66 +393,28 @@ function M.unapprove()
   with_current_file("unapprove")
 end
 
-local function split_lines(text)
-  local lines = vim.split(text, "\n", { plain = true })
-  if lines[#lines] == "" then
-    lines[#lines] = nil
-  end
-  return lines
+-- A hunk from `diff`, with the lines it removes and adds.
+local function to_hunk(index, old, new)
+  local old_start, old_count, new_start, new_count = unpack(index)
+  return {
+    removed = {
+      start = old_start,
+      count = old_count,
+      lines = vim.list_slice(old, old_start, old_start + old_count - 1),
+    },
+    added = { start = new_start, count = new_count, lines = vim.list_slice(new, new_start, new_start + new_count - 1) },
+  }
 end
 
-local function ends_with_newline(text)
-  return text == "" or text:sub(-1) == "\n"
-end
-
-local function read_file(path)
-  local f = assert(io.open(path, "rb"))
-  local text = f:read("*a")
-  f:close()
-  return text
-end
-
-local function empty_on_disk(path)
-  local stat = vim.uv.fs_stat(path)
-  return stat == nil or stat.size == 0
-end
-
----@return string[] removed, string[] added
-local function hunk_parts(hunk)
-  local removed, added = {}, {}
-  for _, line in ipairs(hunk.lines) do
-    local list = line:sub(1, 1) == "-" and removed or added
-    list[#list + 1] = line:sub(2)
-  end
-  return removed, added
-end
-
--- The buffer lines a hunk covers, the way gitsigns' own hunk actions pick it:
--- a deletion sits on the line above it, or on the first line.
+-- The buffer lines a hunk covers, the way the gutter marks it: a deletion sits
+-- on the line above it, or on the first line.
 local function hunk_range(hunk, line_count)
   local first = math.max(hunk.added.start, 1)
   local last = math.max(hunk.added.start + hunk.added.count - 1, first)
   return math.min(first, line_count), math.min(last, line_count)
 end
 
--- The buffer with every hunk undone, which is the text gitsigns diffed it against.
-local function undo_hunks(lines, hunks)
-  local text = vim.list_slice(lines)
-  for i = #hunks, 1, -1 do
-    local hunk = hunks[i]
-    local removed = hunk_parts(hunk)
-    local at = hunk.added.start + (hunk.added.count == 0 and 1 or 0)
-    for _ = 1, hunk.added.count do
-      table.remove(text, at)
-    end
-    for j = #removed, 1, -1 do
-      table.insert(text, at, removed[j])
-    end
-  end
-  return text
-end
-
--- Whether git can express the hunk without changing what gitsigns shows. A
+-- Whether git can express the hunk without changing what the gutter shows. A
 -- file without a final newline marks its last line as such, so a hunk at the
 -- end of the file only works when it replaces the last line of both versions.
 local function fits_end_of_file(hunk, file)
@@ -243,8 +440,8 @@ local function hunk_patch(file, hunks)
   local no_newline = "\\ No newline at end of file"
   local offset = 0
   for _, hunk in ipairs(hunks) do
-    local removed, added = hunk_parts(hunk)
-    local start = hunk.removed.start + (hunk.type == "add" and 1 or 0)
+    local removed, added = hunk.removed.lines, hunk.added.lines
+    local start = hunk.removed.start + (#removed == 0 and 1 or 0)
     local old_start = file.approved_id and start or 0
     out[#out + 1] = ("@@ -%d,%d +%d,%d @@"):format(old_start, #removed, start + offset, #added)
     for _, line in ipairs(removed) do
@@ -264,37 +461,12 @@ local function hunk_patch(file, hunks)
   return table.concat(out, "\n") .. "\n"
 end
 
--- Gitsigns recomputes hunks asynchronously after a base change, so right
--- after `change_base` it still describes the base it had before. Only patches
--- made from hunks that diff the buffer against what is approved right now are
--- safe to apply, so wait for them.
-local function when_hunks_match(buf, approved, attempt, cb)
-  if not vim.api.nvim_buf_is_valid(buf) then
-    return
-  end
-  local hunks = require("gitsigns").get_hunks(buf)
-  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  if hunks and vim.deep_equal(undo_hunks(lines, hunks), split_lines(approved)) then
-    return cb(hunks, lines)
-  end
-  attempt = attempt or 0
-  if attempt >= 80 then
-    return notify("The gutter does not match the review; try again, or approve the whole file", vim.log.levels.WARN)
-  end
-  vim.defer_fn(function()
-    when_hunks_match(buf, approved, attempt + 1, cb)
-  end, 25)
-end
-
 local function approve_hunks(root, name, buf, ref, first, last)
-  if not vim.api.nvim_buf_is_valid(buf) then
-    return
-  end
   local path = vim.fs.joinpath(root, name)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  -- An empty file is a single empty line in the buffer, which gitsigns cannot
-  -- express as a hunk: the patch would add a newline that is not there. There
-  -- is nothing to pick, so approve the empty file as a whole.
+  -- An empty file is a single empty line in the buffer, which no hunk can
+  -- express: the patch would add a newline that is not there. There is nothing
+  -- to pick, so approve the empty file as a whole.
   if #lines == 1 and lines[1] == "" and empty_on_disk(path) then
     return set_mark(root, "approve", { name })
   end
@@ -302,78 +474,53 @@ local function approve_hunks(root, name, buf, ref, first, last)
   local approved_id = git(root, { "rev-parse", "-q", "--verify", ref .. ":" .. name })
   approved_id = approved_id and vim.trim(approved_id)
   local approved = approved_id and git(root, { "cat-file", "blob", approved_id }) or ""
-  when_hunks_match(buf, approved, 0, function(hunks, current)
-    local file = {
-      name = name,
-      approved_id = approved_id,
-      worktree_id = vim.trim(git(root, { "hash-object", "--", name }) or ""),
-      mode = bit.band(assert(vim.uv.fs_stat(path)).mode, tonumber("111", 8)) ~= 0 and "100755" or "100644",
-      approved_count = #split_lines(approved),
-      line_count = #current,
-      approved_nl = ends_with_newline(approved),
-      worktree_nl = ends_with_newline(read_file(path)),
-    }
-    if #hunks == 0 then
-      if file.approved_nl ~= file.worktree_nl then
-        return notify("Only the newline at the end of the file is left; approve the whole file", vim.log.levels.WARN)
-      end
-      return notify("Nothing left to approve in this file")
+  local old = split_lines(approved)
+  local hunks = vim.tbl_map(function(index)
+    return to_hunk(index, old, lines)
+  end, diff(old, lines))
+  local file = {
+    name = name,
+    approved_id = approved_id,
+    worktree_id = vim.trim(git(root, { "hash-object", "--", name }) or ""),
+    mode = bit.band(assert(vim.uv.fs_stat(path)).mode, tonumber("111", 8)) ~= 0 and "100755" or "100644",
+    approved_count = #old,
+    line_count = #lines,
+    approved_nl = ends_with_newline(approved),
+    worktree_nl = ends_with_newline(read_file(path)),
+  }
+  if #hunks == 0 then
+    if file.approved_nl ~= file.worktree_nl then
+      return notify("Only the newline at the end of the file is left; approve the whole file", vim.log.levels.WARN)
     end
-    local chosen = vim.tbl_filter(function(hunk)
-      local hunk_first, hunk_last = hunk_range(hunk, #current)
-      return hunk_first <= last and hunk_last >= first
-    end, hunks)
-    if #chosen == 0 then
-      return notify("No pending hunk here", vim.log.levels.WARN)
-    end
-    for _, hunk in ipairs(chosen) do
-      if not fits_end_of_file(hunk, file) then
-        return notify(
-          "This hunk changes the end of a file without a final newline; approve the whole file",
-          vim.log.levels.WARN
-        )
-      end
-    end
-
-    local code, out, err = run(root, { "approve-patch" }, hunk_patch(file, chosen))
-    if code ~= 0 then
-      return notify(err ~= "" and err or out, vim.log.levels.ERROR)
-    end
-    notify(out)
-    refresh_gutter(root)
-  end)
-end
-
--- Gitsigns skips untracked files by default, and drops an attach call made
--- while it is already attaching the buffer, so retry until it is attached.
-local function when_attached(buf, deadline, cb)
-  local gitsigns = require("gitsigns")
-  if gitsigns.get_hunks(buf) ~= nil then
-    return cb()
+    return notify("Nothing left to approve in this file")
   end
-  if vim.uv.now() >= deadline then
-    return notify("gitsigns is not tracking this file", vim.log.levels.WARN)
+  local chosen = vim.tbl_filter(function(hunk)
+    local hunk_first, hunk_last = hunk_range(hunk, #lines)
+    return hunk_first <= last and hunk_last >= first
+  end, hunks)
+  if #chosen == 0 then
+    return notify("No pending hunk here", vim.log.levels.WARN)
   end
-  gitsigns.attach({ bufnr = buf, force = true }, function(attach_err)
-    if attach_err then
-      return notify(attach_err, vim.log.levels.ERROR)
+  for _, hunk in ipairs(chosen) do
+    if not fits_end_of_file(hunk, file) then
+      return notify(
+        "This hunk changes the end of a file without a final newline; approve the whole file",
+        vim.log.levels.WARN
+      )
     end
-    if gitsigns.get_hunks(buf) ~= nil then
-      return cb()
-    end
-    vim.defer_fn(function()
-      when_attached(buf, deadline, cb)
-    end, 50)
-  end)
+  end
+
+  local code, out, err = run(root, { "approve-patch" }, hunk_patch(file, chosen))
+  if code ~= 0 then
+    return notify(err ~= "" and err or out, vim.log.levels.ERROR)
+  end
+  notify(out)
+  reload_gutter()
 end
 
 -- Approves the hunk under the cursor, or every hunk that touches the lines in
--- `range` ({ first, last }), exactly as gitsigns shows them against the review.
+-- `range` ({ first, last }), exactly as the review gutter shows them.
 function M.approve_hunk(range)
-  local ok, gitsigns = pcall(require, "gitsigns")
-  if not ok then
-    return notify("Requires gitsigns.nvim", vim.log.levels.WARN)
-  end
   local root = repo_root()
   if not root then
     return notify("Not inside a git repository", vim.log.levels.WARN)
@@ -385,6 +532,7 @@ function M.approve_hunk(range)
   local buf = vim.api.nvim_get_current_buf()
   local cursor = vim.fn.line(".")
   local first, last = unpack(range or { cursor, cursor })
+  local shown = gutter_on and buffers[buf] and buffers[buf].hunks
   write_if_modified(vim.fs.joinpath(root, name))
   local code, _, err = run_started(root, { "pending" })
   if code == nil then
@@ -398,23 +546,13 @@ function M.approve_hunk(range)
   if not ref then
     return notify("HEAD is not a branch", vim.log.levels.WARN)
   end
-  gutter_on = true
-
-  local function approve()
-    -- Re-read the base first, so the hunks are against what is approved now.
-    gitsigns.change_base(ref, true, function(change_err)
-      vim.schedule(function()
-        if change_err then
-          return notify(change_err, vim.log.levels.ERROR)
-        end
-        approve_hunks(root, name, buf, ref, first, last)
-      end)
-    end)
+  -- Redraw from the review as it is now. If that moved the hunks the user was
+  -- looking at (a formatter on save, an approval elsewhere), let them look again.
+  gutter_enable()
+  if shown and buffers[buf] and not vim.deep_equal(shown, buffers[buf].hunks) then
+    return notify("The pending hunks changed; check the gutter and try again", vim.log.levels.WARN)
   end
-
-  -- gitsigns leaves untracked files alone by default, but a new file is
-  -- reviewed hunk by hunk like any other.
-  when_attached(buf, vim.uv.now() + 2000, approve)
+  approve_hunks(root, name, buf, ref, first, last)
 end
 
 function M.next_pending()
@@ -442,15 +580,12 @@ function M.next_pending()
   vim.cmd.edit(vim.fn.fnameescape(vim.fs.joinpath(root, target.file)))
 end
 
+-- Shows or hides the review gutter: signs of its own for what is left to
+-- review, next to gitsigns' instead of in place of them.
 function M.toggle_gutter()
-  local ok, gitsigns = pcall(require, "gitsigns")
-  if not ok then
-    return notify("Requires gitsigns.nvim", vim.log.levels.WARN)
-  end
   if gutter_on then
-    gutter_on = false
-    gitsigns.change_base(nil, true)
-    return notify("Gutter: back to normal")
+    gutter_disable()
+    return notify("Review gutter: off")
   end
   local root = repo_root()
   if not root then
@@ -462,9 +597,67 @@ function M.toggle_gutter()
   elseif code > 1 then
     return notify(err, vim.log.levels.ERROR)
   end
-  gutter_on = true
-  refresh_gutter(root)
-  notify("Gutter: only what is left to review")
+  gutter_enable()
+  notify("Review gutter: on")
+end
+
+-- Moves to the next or previous hunk left to review (`direction` is "next" or
+-- "prev"), the way gitsigns' ]h/[h move through its own hunks. Turns the
+-- review gutter on, so you see what you land on.
+function M.nav_hunk(direction)
+  if not gutter_on then
+    M.toggle_gutter()
+    if not gutter_on then
+      return
+    end
+  end
+  local buf = vim.api.nvim_get_current_buf()
+  -- Draw now rather than after the short wait that follows an edit.
+  if buffers[buf] == nil then
+    load_buffer(buf)
+  else
+    draw(buf)
+  end
+  local state = buffers[buf]
+  if not (state and state.hunks) then
+    return notify("This file is not part of the review", vim.log.levels.WARN)
+  end
+  -- Each hunk starts where the gutter marks it; a deletion on the line above it.
+  local starts = {}
+  for _, hunk in ipairs(state.hunks) do
+    local lnum = math.max(hunk[3], 1)
+    if lnum ~= starts[#starts] then
+      starts[#starts + 1] = lnum
+    end
+  end
+  if #starts == 0 then
+    return notify("Nothing left to review in this file")
+  end
+  local cursor, index = vim.fn.line("."), nil
+  if direction == "prev" then
+    for i = #starts, 1, -1 do
+      if starts[i] < cursor then
+        index = i
+        break
+      end
+    end
+    index = index or (vim.o.wrapscan and #starts or nil)
+  else
+    for i, lnum in ipairs(starts) do
+      if lnum > cursor then
+        index = i
+        break
+      end
+    end
+    index = index or (vim.o.wrapscan and 1 or nil)
+  end
+  if not index then
+    return
+  end
+  vim.cmd("normal! m'")
+  vim.api.nvim_win_set_cursor(0, { starts[index], 0 })
+  vim.cmd("normal! zv")
+  vim.api.nvim_echo({ { ("Review hunk %d of %d"):format(index, #starts) } }, false, {})
 end
 
 function M.tracker()
@@ -580,7 +773,14 @@ function M.setup(opts)
     M.approve_hunk({ math.min(first, last), math.max(first, last) })
   end, { desc = "Approve hunks in selection" })
   map("n", M.next_pending, "Next pending file")
-  map("d", M.toggle_gutter, "Toggle gutter: pending only")
+  map("d", M.toggle_gutter, "Toggle review gutter")
+  -- ]h/[h stay gitsigns', for its hunks.
+  vim.keymap.set("n", "]v", function()
+    M.nav_hunk("next")
+  end, { desc = "Next review hunk" })
+  vim.keymap.set("n", "[v", function()
+    M.nav_hunk("prev")
+  end, { desc = "Prev review hunk" })
   if has_sidekick() then
     map("i", M.impact, "Ask agent what approved files are affected")
   end

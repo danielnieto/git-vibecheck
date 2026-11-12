@@ -96,22 +96,30 @@ git vibecheck pending-diff app/views.py | awk '/^@@/ { h++ } h <= 1' | git vibec
 | `<leader>gvr` | Checklist picker. Preview shows what is left to review; `a`/`u` (normal mode) approve or unapprove the file under the cursor, or every file selected with `Tab` |
 | `<leader>gva` | Approve the current file (unsaved changes are written first)                 |
 | `<leader>gvu` | Unapprove the current file                                                   |
-| `<leader>gvh` | Approve the hunk under the cursor; in visual mode, every hunk the selection touches (needs gitsigns.nvim) |
+| `<leader>gvh` | Approve the hunk under the cursor; in visual mode, every hunk the selection touches |
 | `<leader>gvn` | Open the next pending file                                                   |
-| `<leader>gvd` | Toggle the gitsigns gutter between its normal base and "only what is left to review" |
+| `<leader>gvd` | Toggle the review gutter: signs for what is left to review, apart from gitsigns' |
+| `]v` / `[v`   | Next / previous hunk left to review (`]h`/`[h` stay gitsigns', for git's hunks) |
 | `<leader>gvi` | Ask the agent which approved files the pending changes could affect (needs sidekick.nvim) |
 
-The picker needs [snacks.nvim](https://github.com/folke/snacks.nvim), and the
-gutter toggle and hunk approval need
-[gitsigns.nvim](https://github.com/lewis6991/gitsigns.nvim). Everything else
-works without them. Any command run on a branch that is not under review offers
-to start it.
+The picker needs [snacks.nvim](https://github.com/folke/snacks.nvim).
+Everything else works without it. Any command run on a branch that is not under
+review offers to start it.
 
-`<leader>gvh` turns on the review gutter and approves exactly the hunks
-gitsigns shows there, however your `diffopt` cuts them (with `linematch`, one
-changed block can be several hunks). It attaches gitsigns to untracked files on
-demand, so a new file works like any other. Before approving, it checks that
-those hunks are against what is approved right now, and refuses otherwise.
+The review gutter has signs of its own (`+` added, `~` changed, `_`/`‾`
+deleted, highlighted with `GitReviewAdd`, `GitReviewChange` and
+`GitReviewDelete`), so gitsigns never changes base and always shows your usual
+diff. A line that is left to review is marked whether or not it is committed,
+and never-reviewed files compare against the base branch. In LazyVim the review
+signs sit left of the line numbers and gitsigns' on the right. With a plain
+`signcolumn=yes`, both share one column and the higher `priority` wins; set
+`signcolumn=yes:2` to see both.
+
+`<leader>gvh` turns on the review gutter and approves exactly the hunks it
+shows, however your `diffopt` cuts them (with `linematch`, one changed block can
+be several hunks). New files work like any other. If the hunks moved since the
+gutter was drawn (a formatter on save, an approval from a terminal), it redraws
+them and asks you to look again instead of approving.
 
 Options:
 
@@ -119,11 +127,16 @@ Options:
 opts = {
   prefix = "<leader>gv", -- keymap prefix
   keys = true,           -- false to skip the default keymaps
+  gutter = {
+    signs = { add = "+", change = "~", delete = "_", topdelete = "‾" },
+    priority = 7,        -- gitsigns uses 6 and diagnostics 10
+  },
 }
 ```
 
 The functions are public if you prefer your own mappings:
-`require("git-vibecheck").tracker / approve / unapprove / approve_hunk / next_pending / toggle_gutter / impact`.
+`require("git-vibecheck").tracker / approve / unapprove / approve_hunk / next_pending / toggle_gutter / nav_hunk / impact`
+(`nav_hunk("next")` or `nav_hunk("prev")`).
 
 ## Agents
 
@@ -171,7 +184,7 @@ over.
 ## Known limitations
 
 - Renaming a branch leaves its approvals under the old name.
-- Hunks are approved from Neovim (with gitsigns) or through `approve-patch`;
+- Hunks are approved from Neovim or through `approve-patch`;
   there is no interactive hunk mode in the terminal. Unapproving is per file.
 - `<leader>gvh` refuses a hunk that adds or removes lines at the end of a file
   without a final newline, and a file whose final newline changed; approve
@@ -183,8 +196,7 @@ over.
 ```sh
 test/run.sh                       # with the bash on your PATH
 TEST_BASH=/bin/bash test/run.sh   # macOS bash 3.2
-test/nvim.sh                      # hunk approval, needs nvim and gitsigns.nvim
+test/nvim.sh                      # hunk approval and review gutter, needs nvim
 ```
 
-`test/nvim.sh` looks for gitsigns in lazy's directory; set `GITSIGNS_PATH` (and
-`NVIM_BIN`, if nvim is not on your PATH) to point it elsewhere.
+Set `NVIM_BIN` if nvim is not on your PATH.
