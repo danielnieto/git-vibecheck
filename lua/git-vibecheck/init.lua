@@ -39,7 +39,8 @@ local bin = vim.fs.joinpath(vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(source)
 
 local mark_hl = { x = "DiagnosticOk", ["-"] = "DiagnosticInfo", ["~"] = "DiagnosticWarn", [" "] = "DiagnosticHint" }
 
-local sign_hl = { add = "GitReviewAdd", change = "GitReviewChange", delete = "GitReviewDelete", topdelete = "GitReviewDelete" }
+local sign_hl =
+  { add = "GitReviewAdd", change = "GitReviewChange", delete = "GitReviewDelete", topdelete = "GitReviewDelete" }
 
 local ns = vim.api.nvim_create_namespace("git-vibecheck")
 
@@ -687,6 +688,21 @@ function M.tracker()
     return
   elseif code > 1 then
     return notify(err, vim.log.levels.ERROR)
+  end
+  -- An empty picker says nothing: explain why there is nothing to list.
+  local c, out, e = run(root, {})
+  if c == 0 and #parse(out) == 0 then
+    local base = out:match("^%S+ vs (%S+):") or "its base"
+    return notify(
+      (
+        "No files differ from %s, so there is nothing to review.\n"
+        .. "Committed work on the base itself never shows. To review it, pick an older base:\n"
+        .. "git vibecheck --base <ref>"
+      ):format(base),
+      vim.log.levels.WARN
+    )
+  elseif c ~= 0 then
+    return notify(e, vim.log.levels.ERROR)
   end
 
   local function act(action)
