@@ -190,12 +190,12 @@ expect_approved_blob "approved empty content" n
 scenario "the gutter shows what is left, and approving a hunk takes it off"
 printf 'ONE\n2\n3\nNEW\n4\n' >f
 gutter f
-expect_signs "a change, an add and a deletion at the end" "1 ~
-4 +
-5 _"
+expect_signs "a change, an add and a deletion at the end" "1 ┃
+4 ┃
+5 ┃"
 approve f 1
-expect_signs "after approving the change" "4 +
-5 _"
+expect_signs "after approving the change" "4 ┃
+5 ┃"
 expect_mark "partly approved" f "-"
 
 scenario "]v and [v move through the review hunks and wrap around"
@@ -207,24 +207,24 @@ expect_cursor "hunks at 1, 4 and the deletion marked on 5" "4 5 1 5 4"
 scenario "the gutter marks a deletion at the top on the first line"
 printf '2\n3\n4\n5\n' >f
 gutter f
-expect_signs "a deletion at the top" "1 ‾"
+expect_signs "a deletion at the top" "1 ┃"
 
 scenario "the gutter compares a never approved file with the base, not with HEAD"
 printf '1\nTWO\n3\n4\n5\n' >f
 git commit -qam "change line 2"
 gutter f
-expect_signs "the committed change is still pending" "2 ~"
+expect_signs "the committed change is still pending" "2 ┃"
 
 scenario "the gutter follows unsaved edits"
 gutter f "2:TWO"
-expect_signs "the edited line" "2 ~"
+expect_signs "the edited line" "2 ┃"
 [ "$(sed -n 2p f)" = 2 ] || fail "the edit was saved"
 
 scenario "the gutter shows a new file as all pending"
 printf 'hello\nworld\n' >n
 gutter n
-expect_signs "every line added" "1 +
-2 +"
+expect_signs "every line added" "1 ┃
+2 ┃"
 
 scenario "the gutter leaves ignored files alone"
 echo ignored >.gitignore

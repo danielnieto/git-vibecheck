@@ -106,10 +106,12 @@ The picker needs [snacks.nvim](https://github.com/folke/snacks.nvim).
 Everything else works without it. Any command run on a branch that is not under
 review offers to start it.
 
-The review gutter has signs of its own (`+` added, `~` changed, `_`/`‾`
-deleted, highlighted with `GitReviewAdd`, `GitReviewChange` and
-`GitReviewDelete`), so gitsigns never changes base and always shows your usual
-diff. A line that is left to review is marked whether or not it is committed,
+The review gutter has signs of its own, so your usual diff stays in gitsigns,
+which never changes base. By default every line left to review gets the same
+bold bar (`┃`, as gitsigns draws) in one color (`GitReviewSign`), whether it was
+added, changed or deleted: you have `git diff` for the difference. A deletion
+marks the line above it, or the first line. To tell the kinds apart, set a sign
+and a color per kind, see below. A line that is left to review is marked whether or not it is committed,
 and never-reviewed files compare against the base branch. In LazyVim the review
 signs sit left of the line numbers and gitsigns' on the right. With a plain
 `signcolumn=yes`, both share one column and the higher `priority` wins; set
@@ -128,11 +130,33 @@ opts = {
   prefix = "<leader>gv", -- keymap prefix
   keys = true,           -- false to skip the default keymaps
   gutter = {
-    signs = { add = "+", change = "~", delete = "_", topdelete = "‾" },
+    signs = { add = "┃", change = "┃", delete = "┃", topdelete = "┃" },
+    colors = {},         -- per kind, see below
     priority = 7,        -- gitsigns uses 6 and diagnostics 10
   },
 }
 ```
+
+Colors are per kind (`add`, `change`, `delete`; `topdelete` shares `delete`'s).
+A color is a highlight group to link to, or a table for `nvim_set_hl`. Kinds you
+leave out link to `GitReviewSign`, which links to `DiagnosticWarn`:
+
+```lua
+gutter = {
+  signs = { add = "+", change = "~", delete = "_", topdelete = "‾" },
+  colors = {
+    add = "GitSignsAdd",                 -- link to a group
+    change = { fg = "#f9e2af" },         -- or set a color
+    delete = { fg = "#f38ba8", bold = true },
+  },
+}
+```
+
+To recolor everything at once, set `GitReviewSign` instead (it also survives
+`:colorscheme` changes with `default` links, e.g.
+`vim.api.nvim_set_hl(0, "GitReviewSign", { fg = "#89b4fa" })` in an autocmd on
+`ColorScheme`), or the per-kind groups `GitReviewAdd`, `GitReviewChange` and
+`GitReviewDelete`.
 
 The functions are public if you prefer your own mappings:
 `require("git-vibecheck").tracker / approve / unapprove / approve_hunk / next_pending / toggle_gutter / nav_hunk / impact`

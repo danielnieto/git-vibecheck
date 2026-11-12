@@ -7,9 +7,14 @@ M.config = {
   -- Prefix for the default keymaps. Set `keys = false` to map the functions yourself.
   prefix = "<leader>gv",
   keys = true,
-  -- The review gutter draws its own signs, so gitsigns' keep showing your usual diff.
+  -- The review gutter draws its own signs, so gitsigns' keep showing your usual diff. By default
+  -- every line left to review looks the same, whether it was added, changed or deleted.
   gutter = {
-    signs = { add = "+", change = "~", delete = "_", topdelete = "‾" },
+    signs = { add = "┃", change = "┃", delete = "┃", topdelete = "┃" },
+    -- A color per kind: a highlight group to link to, or a table for nvim_set_hl (`{ fg = "#f9e2af" }`).
+    -- Unset kinds link to `GitReviewSign`, which links to `DiagnosticWarn`. A deletion marks the line
+    -- above it (`delete`), or the first line (`topdelete`, which shares `delete`'s color).
+    colors = {},
     -- When signs share a column, the highest priority shows: gitsigns uses 6, diagnostics 10.
     priority = 7,
   },
@@ -34,8 +39,7 @@ local bin = vim.fs.joinpath(vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(source)
 
 local mark_hl = { x = "DiagnosticOk", ["-"] = "DiagnosticInfo", ["~"] = "DiagnosticWarn", [" "] = "DiagnosticHint" }
 
-local sign_hl =
-  { add = "GitReviewAdd", change = "GitReviewChange", delete = "GitReviewDelete", topdelete = "GitReviewDelete" }
+local sign_hl = { add = "GitReviewAdd", change = "GitReviewChange", delete = "GitReviewDelete", topdelete = "GitReviewDelete" }
 
 local ns = vim.api.nvim_create_namespace("git-vibecheck")
 
@@ -301,8 +305,18 @@ local function reload_gutter()
 end
 
 local function set_highlights()
-  for _, group in pairs(sign_hl) do
-    vim.api.nvim_set_hl(0, group, { link = "DiagnosticWarn", default = true })
+  vim.api.nvim_set_hl(0, "GitReviewSign", { link = "DiagnosticWarn", default = true })
+  local colors = M.config.gutter.colors or {}
+  for kind, group in pairs(sign_hl) do
+    local color = colors[kind]
+    if kind ~= "topdelete" then
+      if type(color) == "table" then
+        vim.api.nvim_set_hl(0, group, color)
+      else
+        -- Without a color of its own, the kind follows `GitReviewSign` (or whatever it was set to).
+        vim.api.nvim_set_hl(0, group, { link = color or "GitReviewSign", default = color == nil })
+      end
+    end
   end
 end
 

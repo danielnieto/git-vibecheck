@@ -22,8 +22,8 @@ end
 
 -- "<line>:<text>" replaces a line without saving, so the gutter has to follow the buffer.
 local lnum, text = (os.getenv("SET_LINE") or ""):match("^(%d+):(.*)$")
+
 if lnum then
-  vim.api.nvim_buf_set_lines(buf, tonumber(lnum) - 1, tonumber(lnum), false, { text })
 end
 vim.wait(200) -- the gutter redraws shortly after an edit
 
